@@ -21,7 +21,15 @@ import {
   X,
   Filter,
   CheckCircle2,
-  XCircle
+  XCircle,
+  Clock,
+  Key,
+  ExternalLink,
+  Eye,
+  EyeOff,
+  ShieldCheck,
+  AlertCircle,
+  Sparkles
 } from 'lucide-react';
 import { LogEntry, SymbolSnapshot, CsvRecord } from './types';
 import { NIFTY_500_SYMBOLS, StockSymbol } from './data/nifty500';
@@ -74,6 +82,29 @@ export default function App() {
   const [activeViewTab, setActiveViewTab] = useState<'terminal' | 'csvTable'>('terminal');
   const [csvSearch, setCsvSearch] = useState<string>('');
   const [downloadMenuOpen, setDownloadMenuOpen] = useState<boolean>(false);
+  const [granularity, setGranularity] = useState<'live' | '1s' | '1m'>('live');
+  const [dbStats, setDbStats] = useState<{ totalRows: number; symbols: string[]; firstDate: string; lastDate: string; dbSizeBytes: number } | null>(null);
+
+  // Fyers Token Generator Modal States
+  const [isTokenModalOpen, setIsTokenModalOpen] = useState<boolean>(false);
+  const [authConfig, setAuthConfig] = useState<{
+    appId: string;
+    hasSecretKey: boolean;
+    hasToken: boolean;
+    hasClientId: boolean;
+    tokenPreview: string | null;
+    defaultRedirectUri: string;
+  } | null>(null);
+  const [tokenAppId, setTokenAppId] = useState<string>('');
+  const [tokenSecretKey, setTokenSecretKey] = useState<string>('');
+  const [tokenRedirectUri, setTokenRedirectUri] = useState<string>('http://localhost:3000/api/fyers/callback');
+  const [tokenAuthCode, setTokenAuthCode] = useState<string>('');
+  const [showSecret, setShowSecret] = useState<boolean>(false);
+  const [saveSecretKey, setSaveSecretKey] = useState<boolean>(true);
+  const [tokenLoading, setTokenLoading] = useState<boolean>(false);
+  const [tokenError, setTokenError] = useState<string | null>(null);
+  const [tokenSuccessMsg, setTokenSuccessMsg] = useState<string | null>(null);
+  const [authTab, setAuthTab] = useState<'1click' | 'manual'>('1click');
 
   // Nifty 500 Dropdown States
   const [isDropdownOpen, setIsDropdownOpen] = useState<boolean>(false);
@@ -117,6 +148,52 @@ export default function App() {
   };
 
 
+  // Fetch DB stats & auth config periodically
+  const fetchAuthConfig = async () => {
+    try {
+      const res = await fetch('/api/fyers/auth-config');
+      if (res.ok) {
+        const data = await res.json();
+        setAuthConfig(data);
+        if (data.appId && !tokenAppId) setTokenAppId(data.appId);
+        if (data.defaultRedirectUri && !tokenRedirectUri) setTokenRedirectUri(data.defaultRedirectUri);
+      }
+    } catch {}
+  };
+
+  useEffect(() => {
+    fetchAuthConfig();
+  }, []);
+
+  // Listen for FYERS popup callback success message
+  useEffect(() => {
+    const handleMessage = (event: MessageEvent) => {
+      if (event.data && event.data.type === 'FYERS_AUTH_SUCCESS') {
+        setTokenSuccessMsg('Access Token generated, saved to .env, and activated in live memory!');
+        setTokenLoading(false);
+        fetchAuthConfig();
+        setTimeout(() => {
+          setIsTokenModalOpen(false);
+          setTokenSuccessMsg(null);
+        }, 1800);
+      }
+    };
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, []);
+
+  useEffect(() => {
+    const fetchDbStats = async () => {
+      try {
+        const res = await fetch('/api/csv-files');
+        if (res.ok) setDbStats(await res.json());
+      } catch {}
+    };
+    fetchDbStats();
+    const interval = setInterval(fetchDbStats, 10000);
+    return () => clearInterval(interval);
+  }, []);
+
   // Auto scroll terminal
   useEffect(() => {
     if (autoScroll && terminalContainerRef.current) {
@@ -130,6 +207,86 @@ export default function App() {
     const { scrollTop, scrollHeight, clientHeight } = terminalContainerRef.current;
     const isAtBottom = scrollHeight - scrollTop - clientHeight < 50;
     setAutoScroll(isAtBottom);
+  };
+
+  // 1-Click Browser OAuth
+  const handle1ClickLogin = async () => {
+    if (!tokenAppId.trim()) {
+      setTokenError('App ID is required');
+      return;
+    }
+    if (!tokenSecretKey.trim() && !authConfig?.hasSecretKey) {
+      setTokenError('Secret Key is required to exchange the token');
+      return;
+    }
+    setTokenLoading(true);
+    setTokenError(null);
+    try {
+      const res = await fetch('/api/fyers/auth-url', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          appId: tokenAppId.trim(),
+          secretKey: tokenSecretKey.trim(),
+          redirectUri: tokenRedirectUri.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to generate auth URL');
+
+      // Open OAuth login popup
+      const width = 560;
+      const height = 720;
+      const left = window.screenX + (window.outerWidth - width) / 2;
+      const top = window.screenY + (window.outerHeight - height) / 2;
+      window.open(data.authUrl, 'fyers_oauth_login', `width=${width},height=${height},left=${left},top=${top},menubar=no,status=no,toolbar=no`);
+    } catch (err: any) {
+      setTokenError(err.message || String(err));
+      setTokenLoading(false);
+    }
+  };
+
+  // Manual Exchange for custom redirect URI (e.g. https://127.0.0.1)
+  const handleManualExchange = async () => {
+    if (!tokenAppId.trim()) {
+      setTokenError('App ID is required');
+      return;
+    }
+    if (!tokenSecretKey.trim() && !authConfig?.hasSecretKey) {
+      setTokenError('Secret Key is required');
+      return;
+    }
+    if (!tokenAuthCode.trim()) {
+      setTokenError('Please paste the redirect URL or auth_code from your browser');
+      return;
+    }
+    setTokenLoading(true);
+    setTokenError(null);
+    try {
+      const res = await fetch('/api/fyers/exchange-token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          appId: tokenAppId.trim(),
+          secretKey: tokenSecretKey.trim(),
+          authCodeOrUrl: tokenAuthCode.trim(),
+          saveSecret: saveSecretKey,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to exchange token');
+      setTokenSuccessMsg(data.message || 'Token saved successfully!');
+      setTokenAuthCode('');
+      fetchAuthConfig();
+      setTimeout(() => {
+        setIsTokenModalOpen(false);
+        setTokenSuccessMsg(null);
+      }, 1800);
+    } catch (err: any) {
+      setTokenError(err.message || String(err));
+    } finally {
+      setTokenLoading(false);
+    }
   };
 
   const handleStart = () => {
@@ -153,13 +310,13 @@ export default function App() {
       {
         id: `start-${Date.now()}`,
         type: 'system',
-        rawText: `\n--- [${startTimestamp}] Starting WebSocket session (${selectedSymbols.length} symbols) | CSV logging enabled ---`,
+        rawText: `\n--- [${startTimestamp}] Starting WebSocket session (${selectedSymbols.length} symbols, ${granularity.toUpperCase()}) | SQLite logging enabled ---`,
         timestamp: startTimestamp
       }
     ]);
 
     const symbolsParam = encodeURIComponent(selectedSymbols.join(','));
-    const es = new EventSource(`/api/stream?symbols=${symbolsParam}`);
+    const es = new EventSource(`/api/stream?symbols=${symbolsParam}&granularity=${granularity}`);
     eventSourceRef.current = es;
 
     es.addEventListener('log', (e: MessageEvent) => {
@@ -204,6 +361,8 @@ export default function App() {
           ltp: data.ltp,
           quantity: data.quantity,
           volume: data.volume,
+          tradeValue: data.tradeValue,
+          spread: data.spread,
           average: data.average,
           bid: data.bid,
           ask: data.ask,
@@ -333,26 +492,43 @@ export default function App() {
     setTimeout(() => setCopied(false), 2000);
   };
 
+  // Download current session as CSV (in-memory)
   const handleDownloadCsv = () => {
     if (csvRecords.length === 0) return;
 
-    const headers = ["Date", "Time", "Symbol", "Open", "High", "Low", "Close", "LTP", "Quantity", "Volume", "Average", "Bid", "Ask", "Change", "PercentChange"];
-    const rows = csvRecords.map(r => [
+    const isBars = granularity !== 'live';
+    const headers = isBars
+      ? ["Date", "Time", "Symbol", `Open (${granularity})`, `High (${granularity})`, `Low (${granularity})`, `Close (${granularity})`, "LTP", "Trades in Interval", `Volume (${granularity})`, "Average", "Bid", "Ask", "Change", "% Change"]
+      : ["Date", "Time", "Symbol", "Trade Price (LTP)", "Trade Quantity / Volume", "Trade Value (₹)", "Bid", "Ask", "Spread", "Change", "% Change"];
+
+    const rows = csvRecords.map(r => isBars ? [
       `"${r.date || ''}"`,
       `"${r.time || ''}"`,
       `"${r.symbol}"`,
-      r.open !== undefined ? r.open.toFixed(2) : "",
-      r.high !== undefined ? r.high.toFixed(2) : "",
-      r.low !== undefined ? r.low.toFixed(2) : "",
-      r.close !== undefined ? r.close.toFixed(2) : "",
-      r.ltp.toFixed(2),
-      r.quantity !== undefined ? r.quantity : "",
-      r.volume !== undefined ? r.volume : "",
-      r.average !== undefined ? r.average.toFixed(2) : "",
-      r.bid !== undefined ? r.bid.toFixed(2) : "",
-      r.ask !== undefined ? r.ask.toFixed(2) : "",
-      r.change !== undefined ? r.change.toFixed(2) : "",
-      r.pChange !== undefined ? r.pChange.toFixed(2) : ""
+      r.open != null ? r.open.toFixed(2) : "",
+      r.high != null ? r.high.toFixed(2) : "",
+      r.low != null ? r.low.toFixed(2) : "",
+      r.close != null ? r.close.toFixed(2) : "",
+      r.ltp != null ? r.ltp.toFixed(2) : "",
+      r.quantity != null ? r.quantity : "",
+      r.volume != null ? r.volume : "",
+      r.average != null ? r.average.toFixed(2) : "",
+      r.bid != null ? r.bid.toFixed(2) : "",
+      r.ask != null ? r.ask.toFixed(2) : "",
+      r.change != null ? r.change.toFixed(2) : "",
+      r.pChange != null ? r.pChange.toFixed(2) : ""
+    ] : [
+      `"${r.date || ''}"`,
+      `"${r.time || ''}"`,
+      `"${r.symbol}"`,
+      r.ltp != null ? r.ltp.toFixed(2) : "",
+      r.quantity != null ? r.quantity : "",
+      r.tradeValue != null ? r.tradeValue.toFixed(2) : (r.ltp != null && r.quantity != null ? (r.ltp * r.quantity).toFixed(2) : ""),
+      r.bid != null ? r.bid.toFixed(2) : "",
+      r.ask != null ? r.ask.toFixed(2) : "",
+      r.spread != null ? r.spread.toFixed(2) : (r.ask != null && r.bid != null ? (r.ask - r.bid).toFixed(2) : ""),
+      r.change != null ? r.change.toFixed(2) : "",
+      r.pChange != null ? r.pChange.toFixed(2) : ""
     ]);
 
     const csvContent = "data:text/csv;charset=utf-8," + [headers.join(","), ...rows.map(e => e.join(","))].join("\n");
@@ -360,7 +536,7 @@ export default function App() {
     const link = document.createElement("a");
     const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     link.setAttribute("href", encodedUri);
-    link.setAttribute("download", `fyers_prices_${ts}.csv`);
+    link.setAttribute("download", `fyers_prices_${granularity}_${ts}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -370,34 +546,76 @@ export default function App() {
     setTimeout(() => setDownloadSuccess(false), 2500);
   };
 
+  // Download full SQLite DB as XLSX from server
+  const handleDownloadFromDb = async (symbol?: string) => {
+    try {
+      const url = symbol ? `/api/download-csv?granularity=${granularity}&symbol=${encodeURIComponent(symbol)}` : `/api/download-csv?granularity=${granularity}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(await res.text());
+      const blob = await res.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = objectUrl;
+      const cd = res.headers.get('Content-Disposition') || '';
+      const match = cd.match(/filename="?([^"]+)"?/);
+      a.download = match ? match[1] : `fyers_prices_${granularity}_${new Date().toISOString().slice(0, 10)}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(objectUrl);
+      setDownloadSuccess(true);
+      setDownloadMenuOpen(false);
+      setTimeout(() => setDownloadSuccess(false), 2500);
+    } catch (err) {
+      console.error('DB download failed:', err);
+    }
+  };
+
+  // Download current session as Excel (in-memory)
   const handleDownloadExcel = () => {
     if (csvRecords.length === 0) return;
 
-    const headers = ["Date", "Time", "Symbol", "Open", "High", "Low", "Close", "LTP", "Quantity", "Volume", "Average", "Bid", "Ask", "Change", "Percent Change (%)"];
-    const rows = csvRecords.map(r => ({
+    const isBars = granularity !== 'live';
+    const headers = isBars
+      ? ["Date", "Time", "Symbol", `Open (${granularity})`, `High (${granularity})`, `Low (${granularity})`, `Close (${granularity})`, "LTP", "Trades in Interval", `Volume (${granularity})`, "Average", "Bid", "Ask", "Change", "% Change"]
+      : ["Date", "Time", "Symbol", "Trade Price (LTP)", "Trade Quantity / Volume", "Trade Value (₹)", "Bid", "Ask", "Spread", "Change", "Percent Change (%)"];
+
+    const rows = csvRecords.map(r => isBars ? ({
       "Date": r.date || '',
       "Time": r.time || '',
       "Symbol": r.symbol,
-      "Open": r.open !== undefined ? r.open : '',
-      "High": r.high !== undefined ? r.high : '',
-      "Low": r.low !== undefined ? r.low : '',
-      "Close": r.close !== undefined ? r.close : '',
+      [`Open (${granularity})`]: r.open != null ? r.open : '',
+      [`High (${granularity})`]: r.high != null ? r.high : '',
+      [`Low (${granularity})`]: r.low != null ? r.low : '',
+      [`Close (${granularity})`]: r.close != null ? r.close : '',
       "LTP": r.ltp,
-      "Quantity": r.quantity !== undefined ? r.quantity : '',
-      "Volume": r.volume !== undefined ? r.volume : '',
-      "Average": r.average !== undefined ? r.average : '',
-      "Bid": r.bid !== undefined ? r.bid : '',
-      "Ask": r.ask !== undefined ? r.ask : '',
-      "Change": r.change !== undefined ? r.change : '',
-      "Percent Change (%)": r.pChange !== undefined ? r.pChange : ''
+      "Trades in Interval": r.quantity != null ? r.quantity : '',
+      [`Volume (${granularity})`]: r.volume != null ? r.volume : '',
+      "Average": r.average != null ? r.average : '',
+      "Bid": r.bid != null ? r.bid : '',
+      "Ask": r.ask != null ? r.ask : '',
+      "Change": r.change != null ? r.change : '',
+      "% Change": r.pChange != null ? r.pChange : ''
+    }) : ({
+      "Date": r.date || '',
+      "Time": r.time || '',
+      "Symbol": r.symbol,
+      "Trade Price (LTP)": r.ltp,
+      "Trade Quantity / Volume": r.quantity != null ? r.quantity : '',
+      "Trade Value (₹)": r.tradeValue != null ? r.tradeValue : (r.ltp != null && r.quantity != null ? Number((r.ltp * r.quantity).toFixed(2)) : ''),
+      "Bid": r.bid != null ? r.bid : '',
+      "Ask": r.ask != null ? r.ask : '',
+      "Spread": r.spread != null ? r.spread : (r.ask != null && r.bid != null ? Number((r.ask - r.bid).toFixed(2)) : ''),
+      "Change": r.change != null ? r.change : '',
+      "Percent Change (%)": r.pChange != null ? r.pChange : ''
     }));
 
     const worksheet = XLSX.utils.json_to_sheet(rows, { header: headers });
     const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, worksheet, "FYERS Prices");
+    XLSX.utils.book_append_sheet(workbook, worksheet, `FYERS ${granularity.toUpperCase()}`);
 
     const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    XLSX.writeFile(workbook, `fyers_prices_${ts}.xlsx`);
+    XLSX.writeFile(workbook, `fyers_prices_${granularity}_${ts}.xlsx`);
 
     setDownloadSuccess(true);
     setDownloadMenuOpen(false);
@@ -551,12 +769,33 @@ export default function App() {
 
         {/* Live Status Indicator & CSV Status */}
         <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
-          
-          {/* CSV Recording Badge */}
+
+          {/* Fyers Auth / Token Button */}
+          <button
+            id="btn-fyers-auth"
+            onClick={() => {
+              fetchAuthConfig();
+              setIsTokenModalOpen(true);
+            }}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-mono font-bold transition-all cursor-pointer shadow-xs ${
+              authConfig?.hasToken
+                ? 'bg-emerald-50 text-emerald-800 border border-emerald-300 hover:bg-emerald-100 hover:border-emerald-400'
+                : 'bg-amber-50 text-amber-900 border border-amber-300 hover:bg-amber-100 animate-pulse'
+            }`}
+            title="Generate or update daily FYERS access token"
+          >
+            <Key className="w-3.5 h-3.5 text-current" />
+            <span className="text-[11px]">
+              {authConfig?.hasToken ? 'Token Active' : 'Generate Token'}
+            </span>
+          </button>
+
+          {/* DB Stats Badge */}
           <div className="web2-badge flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs text-sky-900 font-mono font-medium">
             <FileSpreadsheet className={`w-3.5 h-3.5 ${isRunning ? 'text-sky-600 animate-pulse' : 'text-sky-500'}`} />
             <span className="text-[11px]">
-              CSV: <span className="font-bold text-sky-950">{csvRecords.length}</span> rows
+              DB: <span className="font-bold text-sky-950">{dbStats?.totalRows?.toLocaleString() ?? '—'}</span> ticks
+              {dbStats?.dbSizeBytes ? <span className="ml-1 opacity-70">({(dbStats.dbSizeBytes / 1024).toFixed(0)}KB)</span> : null}
             </span>
           </div>
 
@@ -652,18 +891,34 @@ export default function App() {
               <span>Stop</span>
             </button>
 
-            {/* Download Dropdown Button (CSV & Excel) */}
+            {/* Granularity Dropdown */}
+            <div className="flex items-center gap-1.5 bg-white/90 border border-sky-200/80 rounded-xl px-3 py-2 shadow-xs">
+              <Clock className="w-3.5 h-3.5 text-sky-600" />
+              <span className="text-[10px] font-bold text-sky-900 uppercase font-mono tracking-wider">
+                Granularity:
+              </span>
+              <select
+                id="select-granularity"
+                value={granularity}
+                onChange={(e) => setGranularity(e.target.value as 'live' | '1s' | '1m')}
+                disabled={isRunning}
+                className={`bg-transparent text-xs font-mono font-bold text-sky-950 focus:outline-none cursor-pointer ${
+                  isRunning ? 'opacity-60 cursor-not-allowed' : ''
+                }`}
+              >
+                <option value="live">Live (Tick-by-Tick)</option>
+                <option value="1s">1-Second Bars</option>
+                <option value="1m">1-Minute Bars</option>
+              </select>
+            </div>
+
+            {/* Download Dropdown Button */}
             <div className="relative" ref={downloadMenuRef}>
               <button
                 id="btn-download-menu"
                 onClick={() => setDownloadMenuOpen(!downloadMenuOpen)}
-                disabled={csvRecords.length === 0}
-                className={`flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl font-bold text-xs transition-all ${
-                  csvRecords.length === 0
-                    ? 'bg-slate-200 text-slate-400 cursor-not-allowed border border-slate-300'
-                    : 'glossy-btn-cyan text-white cursor-pointer hover:brightness-105'
-                }`}
-                title="Download recorded prices as CSV or Excel file"
+                className="flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl font-bold text-xs transition-all glossy-btn-cyan text-white cursor-pointer hover:brightness-105"
+                title="Download recorded prices as XLSX"
               >
                 {downloadSuccess ? (
                   <>
@@ -674,9 +929,9 @@ export default function App() {
                   <>
                     <Download className="w-4 h-4" />
                     <span>Download</span>
-                    {csvRecords.length > 0 && (
+                    {(dbStats?.totalRows ?? 0) > 0 && (
                       <span className="ml-0.5 px-1.5 py-0.2 rounded-full bg-white/30 text-white text-[10px] font-mono font-extrabold">
-                        {csvRecords.length}
+                        {dbStats!.totalRows.toLocaleString()}
                       </span>
                     )}
                     <ChevronDown className={`w-3.5 h-3.5 transition-transform ${downloadMenuOpen ? 'rotate-180' : ''}`} />
@@ -685,35 +940,59 @@ export default function App() {
               </button>
 
               {/* Download Format Popover Menu */}
-              {downloadMenuOpen && csvRecords.length > 0 && (
-                <div className="absolute left-0 mt-2 z-50 w-60 web2-card p-2 rounded-2xl shadow-2xl border border-sky-300/90 bg-white/98 backdrop-blur-2xl animate-in fade-in slide-in-from-top-2 duration-150">
+              {downloadMenuOpen && (
+                <div className="absolute left-0 mt-2 z-50 w-72 web2-card p-2 rounded-2xl shadow-2xl border border-sky-300/90 bg-white/98 backdrop-blur-2xl animate-in fade-in slide-in-from-top-2 duration-150">
                   <div className="px-3 py-1.5 text-[10px] uppercase font-mono tracking-wider font-bold text-sky-800 border-b border-sky-100 mb-1">
-                    Select Export Format ({csvRecords.length} records)
+                    Export Data
                   </div>
 
+                  {/* Full DB export */}
                   <button
-                    onClick={handleDownloadCsv}
-                    className="w-full flex items-center gap-3 px-3 py-2 rounded-xl text-left hover:bg-sky-50 text-sky-950 transition-colors cursor-pointer group"
-                  >
-                    <div className="p-2 rounded-lg bg-sky-100 text-sky-700 group-hover:bg-sky-600 group-hover:text-white transition-colors">
-                      <FileCode2 className="w-4 h-4" />
-                    </div>
-                    <div>
-                      <div className="font-bold text-xs">CSV File (.csv)</div>
-                      <div className="text-[10px] text-sky-700 font-mono">Comma-separated data</div>
-                    </div>
-                  </button>
-
-                  <button
-                    onClick={handleDownloadExcel}
+                    onClick={() => handleDownloadFromDb()}
                     className="w-full flex items-center gap-3 px-3 py-2 rounded-xl text-left hover:bg-emerald-50 text-emerald-950 transition-colors cursor-pointer group"
                   >
                     <div className="p-2 rounded-lg bg-emerald-100 text-emerald-700 group-hover:bg-emerald-600 group-hover:text-white transition-colors">
                       <FileSpreadsheet className="w-4 h-4" />
                     </div>
                     <div>
-                      <div className="font-bold text-xs">Excel Workbook (.xlsx)</div>
-                      <div className="text-[10px] text-emerald-700 font-mono">Formatted Excel sheet</div>
+                      <div className="font-bold text-xs">Full DB Export (.xlsx)</div>
+                      <div className="text-[10px] text-emerald-700 font-mono">
+                        {dbStats ? `${dbStats.totalRows.toLocaleString()} rows · ${dbStats.firstDate ?? ''} → ${dbStats.lastDate ?? ''}` : 'All ticks from SQLite'}
+                      </div>
+                    </div>
+                  </button>
+
+                  {/* Session CSV */}
+                  <button
+                    onClick={handleDownloadCsv}
+                    disabled={csvRecords.length === 0}
+                    className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-left transition-colors group ${
+                      csvRecords.length === 0 ? 'opacity-40 cursor-not-allowed' : 'hover:bg-sky-50 text-sky-950 cursor-pointer'
+                    }`}
+                  >
+                    <div className="p-2 rounded-lg bg-sky-100 text-sky-700 group-hover:bg-sky-600 group-hover:text-white transition-colors">
+                      <FileCode2 className="w-4 h-4" />
+                    </div>
+                    <div>
+                      <div className="font-bold text-xs">Session CSV (.csv)</div>
+                      <div className="text-[10px] text-sky-700 font-mono">{csvRecords.length} rows this session</div>
+                    </div>
+                  </button>
+
+                  {/* Session Excel */}
+                  <button
+                    onClick={handleDownloadExcel}
+                    disabled={csvRecords.length === 0}
+                    className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-left transition-colors group ${
+                      csvRecords.length === 0 ? 'opacity-40 cursor-not-allowed' : 'hover:bg-violet-50 text-violet-950 cursor-pointer'
+                    }`}
+                  >
+                    <div className="p-2 rounded-lg bg-violet-100 text-violet-700 group-hover:bg-violet-600 group-hover:text-white transition-colors">
+                      <FileSpreadsheet className="w-4 h-4" />
+                    </div>
+                    <div>
+                      <div className="font-bold text-xs">Session Excel (.xlsx)</div>
+                      <div className="text-[10px] text-violet-700 font-mono">{csvRecords.length} rows this session</div>
                     </div>
                   </button>
                 </div>
@@ -1161,7 +1440,7 @@ export default function App() {
 
                     <div className="flex items-baseline justify-between mb-2">
                       <div className="text-2xl font-black font-mono text-sky-950 tracking-tight">
-                        ₹{snap.ltp.toFixed(2)}
+                        ₹{snap.ltp != null ? snap.ltp.toFixed(2) : '-'}
                       </div>
                       <div className={`flex items-center text-xs font-bold font-mono px-2 py-0.5 rounded-full ${
                         isPositive 
@@ -1169,8 +1448,8 @@ export default function App() {
                           : 'bg-rose-100 text-rose-800 border border-rose-300'
                       }`}>
                         {isPositive ? <ArrowUpRight className="w-3.5 h-3.5 mr-0.5" /> : <ArrowDownRight className="w-3.5 h-3.5 mr-0.5" />}
-                        <span>{isPositive ? '+' : ''}{snap.change.toFixed(2)}</span>
-                        <span className="ml-1 opacity-90">({isPositive ? '+' : ''}{snap.pChange.toFixed(2)}%)</span>
+                        <span>{isPositive ? '+' : ''}{snap.change != null ? snap.change.toFixed(2) : '-'}</span>
+                        <span className="ml-1 opacity-90">({isPositive ? '+' : ''}{snap.pChange != null ? snap.pChange.toFixed(2) : '-'}%)</span>
                       </div>
                     </div>
 
@@ -1178,26 +1457,26 @@ export default function App() {
                     <div className="grid grid-cols-4 gap-1 p-1.5 rounded-xl bg-sky-50/80 border border-sky-100 text-[10px] font-mono text-sky-950 text-center mb-2">
                       <div>
                         <span className="text-sky-500 font-sans block text-[9px]">OPEN</span>
-                        <span className="font-bold">{snap.open !== undefined ? snap.open.toFixed(2) : '-'}</span>
+                        <span className="font-bold">{snap.open != null ? snap.open.toFixed(2) : '-'}</span>
                       </div>
                       <div>
                         <span className="text-emerald-600 font-sans block text-[9px]">HIGH</span>
-                        <span className="font-bold">{snap.high !== undefined ? snap.high.toFixed(2) : '-'}</span>
+                        <span className="font-bold">{snap.high != null ? snap.high.toFixed(2) : '-'}</span>
                       </div>
                       <div>
                         <span className="text-rose-500 font-sans block text-[9px]">LOW</span>
-                        <span className="font-bold">{snap.low !== undefined ? snap.low.toFixed(2) : '-'}</span>
+                        <span className="font-bold">{snap.low != null ? snap.low.toFixed(2) : '-'}</span>
                       </div>
                       <div>
                         <span className="text-sky-600 font-sans block text-[9px]">CLOSE</span>
-                        <span className="font-bold">{snap.close !== undefined ? snap.close.toFixed(2) : '-'}</span>
+                        <span className="font-bold">{snap.close != null ? snap.close.toFixed(2) : '-'}</span>
                       </div>
                     </div>
 
                     <div className="pt-2 border-t border-sky-100 flex items-center justify-between text-[11px] text-sky-900 font-mono">
                       <span>Qty: <strong className="text-sky-950">{snap.quantity || '-'}</strong></span>
-                      <span>Vol: <strong className="text-sky-950">{snap.volume.toLocaleString()}</strong></span>
-                      <span>Avg: <strong className="text-sky-950">{snap.average !== undefined ? snap.average.toFixed(2) : '-'}</strong></span>
+                      <span>Vol: <strong className="text-sky-950">{snap.volume != null ? snap.volume.toLocaleString() : '-'}</strong></span>
+                      <span>Avg: <strong className="text-sky-950">{snap.average != null ? snap.average.toFixed(2) : '-'}</strong></span>
                     </div>
                   </div>
                 );
@@ -1243,7 +1522,9 @@ export default function App() {
                   }`}
                 >
                   <FileSpreadsheet className="w-3.5 h-3.5" />
-                  <span>CSV Logger Table ({csvRecords.length})</span>
+                  <span>
+                    {granularity === 'live' ? 'Live Ticks Table' : granularity === '1s' ? '1-Sec Bars Table' : '1-Min Bars Table'} ({csvRecords.length})
+                  </span>
                 </button>
               </div>
             </div>
@@ -1383,7 +1664,7 @@ export default function App() {
                       <span className="text-emerald-300/90">
                         Avg: {log.average?.toFixed(2) ?? '-'}
                       </span>
-                      {log.bid !== undefined && log.ask !== undefined && (
+                      {log.bid != null && log.ask != null && (
                         <>
                           <span className="text-slate-700 select-none">|</span>
                           <span className="text-slate-400">
@@ -1426,53 +1707,91 @@ export default function App() {
                 <div className="min-w-full inline-block align-middle">
                   <table className="w-full text-left font-mono text-xs text-slate-200 border-collapse">
                     <thead>
-                      <tr className="bg-slate-900/90 text-slate-400 font-bold border-b border-slate-800 text-[11px] uppercase tracking-wider sticky top-0 z-10">
-                        <th className="py-2.5 px-3">Date</th>
-                        <th className="py-2.5 px-3">Time</th>
-                        <th className="py-2.5 px-3 text-sky-400">Symbol</th>
-                        <th className="py-2.5 px-3 text-slate-300">Open</th>
-                        <th className="py-2.5 px-3 text-emerald-400">High</th>
-                        <th className="py-2.5 px-3 text-rose-400">Low</th>
-                        <th className="py-2.5 px-3 text-slate-300">Close</th>
-                        <th className="py-2.5 px-3 text-white">LTP</th>
-                        <th className="py-2.5 px-3 text-cyan-300">Quantity</th>
-                        <th className="py-2.5 px-3 text-amber-300">Volume</th>
-                        <th className="py-2.5 px-3 text-emerald-300">Average</th>
-                        <th className="py-2.5 px-3 text-slate-400">Bid</th>
-                        <th className="py-2.5 px-3 text-slate-400">Ask</th>
-                        <th className="py-2.5 px-3 text-right">Change</th>
-                        <th className="py-2.5 px-3 text-right">% Change</th>
-                      </tr>
+                      {granularity === 'live' ? (
+                        <tr className="bg-slate-900/90 text-slate-400 font-bold border-b border-slate-800 text-[11px] uppercase tracking-wider sticky top-0 z-10">
+                          <th className="py-2.5 px-3">Date</th>
+                          <th className="py-2.5 px-3">Time</th>
+                          <th className="py-2.5 px-3 text-sky-400">Symbol</th>
+                          <th className="py-2.5 px-3 text-white">LTP</th>
+                          <th className="py-2.5 px-3 text-cyan-300">Trade Qty / Vol</th>
+                          <th className="py-2.5 px-3 text-amber-300">Trade Value (₹)</th>
+                          <th className="py-2.5 px-3 text-slate-400">Bid</th>
+                          <th className="py-2.5 px-3 text-slate-400">Ask</th>
+                          <th className="py-2.5 px-3 text-slate-300">Spread</th>
+                          <th className="py-2.5 px-3 text-right">Change</th>
+                          <th className="py-2.5 px-3 text-right">% Change</th>
+                        </tr>
+                      ) : (
+                        <tr className="bg-slate-900/90 text-slate-400 font-bold border-b border-slate-800 text-[11px] uppercase tracking-wider sticky top-0 z-10">
+                          <th className="py-2.5 px-3">Date</th>
+                          <th className="py-2.5 px-3">Time</th>
+                          <th className="py-2.5 px-3 text-sky-400">Symbol</th>
+                          <th className="py-2.5 px-3 text-slate-300">{granularity} Open</th>
+                          <th className="py-2.5 px-3 text-emerald-400">{granularity} High</th>
+                          <th className="py-2.5 px-3 text-rose-400">{granularity} Low</th>
+                          <th className="py-2.5 px-3 text-slate-300">{granularity} Close</th>
+                          <th className="py-2.5 px-3 text-white">LTP</th>
+                          <th className="py-2.5 px-3 text-cyan-300">Trades</th>
+                          <th className="py-2.5 px-3 text-amber-300">{granularity} Vol</th>
+                          <th className="py-2.5 px-3 text-slate-400">Bid</th>
+                          <th className="py-2.5 px-3 text-slate-400">Ask</th>
+                          <th className="py-2.5 px-3 text-right">Change</th>
+                          <th className="py-2.5 px-3 text-right">% Change</th>
+                        </tr>
+                      )}
                     </thead>
                     <tbody className="divide-y divide-slate-800/60 font-mono text-[12px]">
                       {csvRecords
                         .slice()
                         .reverse()
-                        .filter(r => !csvSearch || r.symbol.toLowerCase().includes(csvSearch.toLowerCase()) || r.date.includes(csvSearch) || r.time.includes(csvSearch))
+                        .filter(r => !csvSearch || (r.symbol && r.symbol.toLowerCase().includes(csvSearch.toLowerCase())) || (r.date && r.date.includes(csvSearch)) || (r.time && r.time.includes(csvSearch)))
                         .map((rec, i) => {
                           const isPos = (rec.change ?? 0) >= 0;
-                          return (
+                          return granularity === 'live' ? (
                             <tr key={`csv-row-${i}`} className="hover:bg-slate-900/80 transition-colors">
                               <td className="py-2 px-3 text-slate-400">{rec.date || '-'}</td>
                               <td className="py-2 px-3 text-slate-300">{rec.time || '-'}</td>
                               <td className="py-2 px-3 font-bold text-sky-300">{rec.symbol}</td>
-                              <td className="py-2 px-3 text-slate-300">{rec.open !== undefined ? rec.open.toFixed(2) : '-'}</td>
-                              <td className="py-2 px-3 text-emerald-400 font-semibold">{rec.high !== undefined ? rec.high.toFixed(2) : '-'}</td>
-                              <td className="py-2 px-3 text-rose-400 font-semibold">{rec.low !== undefined ? rec.low.toFixed(2) : '-'}</td>
-                              <td className="py-2 px-3 text-slate-300">{rec.close !== undefined ? rec.close.toFixed(2) : '-'}</td>
                               <td className={`py-2 px-3 font-extrabold ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
-                                {rec.ltp.toFixed(2)}
+                                {rec.ltp != null ? rec.ltp.toFixed(2) : '-'}
                               </td>
-                              <td className="py-2 px-3 text-cyan-300">{rec.quantity !== undefined ? rec.quantity : '-'}</td>
-                              <td className="py-2 px-3 text-amber-300">{rec.volume !== undefined ? rec.volume.toLocaleString() : '-'}</td>
-                              <td className="py-2 px-3 text-emerald-300">{rec.average !== undefined ? rec.average.toFixed(2) : '-'}</td>
-                              <td className="py-2 px-3 text-slate-400">{rec.bid !== undefined ? rec.bid.toFixed(2) : '-'}</td>
-                              <td className="py-2 px-3 text-slate-400">{rec.ask !== undefined ? rec.ask.toFixed(2) : '-'}</td>
-                              <td className={`py-2 px-3 text-right font-bold ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
-                                {isPos ? '+' : ''}{rec.change !== undefined ? rec.change.toFixed(2) : '-'}
+                              <td className="py-2 px-3 text-cyan-300 font-bold">{rec.quantity != null ? rec.quantity : '-'}</td>
+                              <td className="py-2 px-3 text-amber-300 font-bold">
+                                ₹{((rec.tradeValue ?? (rec.ltp * (rec.quantity ?? 0)))).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                              </td>
+                              <td className="py-2 px-3 text-slate-400">{rec.bid != null ? rec.bid.toFixed(2) : '-'}</td>
+                              <td className="py-2 px-3 text-slate-400">{rec.ask != null ? rec.ask.toFixed(2) : '-'}</td>
+                              <td className="py-2 px-3 text-slate-300">
+                                {rec.spread != null ? rec.spread.toFixed(2) : (rec.ask != null && rec.bid != null ? (rec.ask - rec.bid).toFixed(2) : '-')}
                               </td>
                               <td className={`py-2 px-3 text-right font-bold ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
-                                {isPos ? '+' : ''}{rec.pChange !== undefined ? rec.pChange.toFixed(2) : '-'}%
+                                {isPos ? '+' : ''}{rec.change != null ? rec.change.toFixed(2) : '-'}
+                              </td>
+                              <td className={`py-2 px-3 text-right font-bold ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                {isPos ? '+' : ''}{rec.pChange != null ? rec.pChange.toFixed(2) : '-'}%
+                              </td>
+                            </tr>
+                          ) : (
+                            <tr key={`csv-row-${i}`} className="hover:bg-slate-900/80 transition-colors">
+                              <td className="py-2 px-3 text-slate-400">{rec.date || '-'}</td>
+                              <td className="py-2 px-3 text-slate-300">{rec.time || '-'}</td>
+                              <td className="py-2 px-3 font-bold text-sky-300">{rec.symbol}</td>
+                              <td className="py-2 px-3 text-slate-300">{rec.open != null ? rec.open.toFixed(2) : '-'}</td>
+                              <td className="py-2 px-3 text-emerald-400 font-semibold">{rec.high != null ? rec.high.toFixed(2) : '-'}</td>
+                              <td className="py-2 px-3 text-rose-400 font-semibold">{rec.low != null ? rec.low.toFixed(2) : '-'}</td>
+                              <td className="py-2 px-3 text-slate-300">{rec.close != null ? rec.close.toFixed(2) : '-'}</td>
+                              <td className={`py-2 px-3 font-extrabold ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                {rec.ltp != null ? rec.ltp.toFixed(2) : '-'}
+                              </td>
+                              <td className="py-2 px-3 text-cyan-300 font-bold">{rec.quantity != null ? rec.quantity : '-'}</td>
+                              <td className="py-2 px-3 text-amber-300 font-bold">{rec.volume != null ? rec.volume.toLocaleString() : '-'}</td>
+                              <td className="py-2 px-3 text-slate-400">{rec.bid != null ? rec.bid.toFixed(2) : '-'}</td>
+                              <td className="py-2 px-3 text-slate-400">{rec.ask != null ? rec.ask.toFixed(2) : '-'}</td>
+                              <td className={`py-2 px-3 text-right font-bold ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                {isPos ? '+' : ''}{rec.change != null ? rec.change.toFixed(2) : '-'}
+                              </td>
+                              <td className={`py-2 px-3 text-right font-bold ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                {isPos ? '+' : ''}{rec.pChange != null ? rec.pChange.toFixed(2) : '-'}%
                               </td>
                             </tr>
                           );
@@ -1498,6 +1817,229 @@ export default function App() {
           CSV Logger: Date, Time, Symbol, Open, High, Low, Close, LTP, Quantity, Volume, Average, Bid, Ask
         </div>
       </footer>
+
+      {/* FYERS Token Generator Modal */}
+      {isTokenModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/60 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="relative w-full max-w-lg bg-white/95 rounded-3xl border border-sky-200 shadow-2xl p-6 sm:p-7 flex flex-col gap-5 text-slate-800">
+            
+            {/* Header */}
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-sky-100 border border-sky-200 flex items-center justify-center text-sky-600 shadow-inner">
+                  <Key className="w-5 h-5" />
+                </div>
+                <div>
+                  <h2 className="text-lg font-bold text-sky-950 leading-tight">
+                    FYERS Token Generator
+                  </h2>
+                  <p className="text-xs text-slate-500 font-medium">
+                    1-Click automated daily Access Token generation
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsTokenModalOpen(false)}
+                className="p-1.5 rounded-xl text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Token Status Pill */}
+            <div className="flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-slate-50 border border-slate-200 text-xs font-mono">
+              <span className="text-slate-600">Current Status:</span>
+              <span className={`font-bold flex items-center gap-1.5 ${authConfig?.hasToken ? 'text-emerald-700' : 'text-amber-700'}`}>
+                {authConfig?.hasToken ? (
+                  <>
+                    <ShieldCheck className="w-4 h-4 text-emerald-600" />
+                    <span>Active ({authConfig.tokenPreview})</span>
+                  </>
+                ) : (
+                  <>
+                    <AlertCircle className="w-4 h-4 text-amber-600" />
+                    <span>Missing / Expired</span>
+                  </>
+                )}
+              </span>
+            </div>
+
+            {/* Tabs: 1-Click OAuth vs Manual Paste */}
+            <div className="flex items-center rounded-xl bg-slate-100 p-1 border border-slate-200 text-xs font-bold">
+              <button
+                type="button"
+                onClick={() => setAuthTab('1click')}
+                className={`flex-1 py-1.5 rounded-lg transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                  authTab === '1click'
+                    ? 'bg-white text-sky-950 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <Sparkles className="w-3.5 h-3.5 text-sky-600" />
+                <span>1-Click Auto OAuth</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setAuthTab('manual')}
+                className={`flex-1 py-1.5 rounded-lg transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
+                  authTab === 'manual'
+                    ? 'bg-white text-sky-950 shadow-xs'
+                    : 'text-slate-600 hover:text-slate-900'
+                }`}
+              >
+                <ExternalLink className="w-3.5 h-3.5 text-slate-600" />
+                <span>Manual Paste (127.0.0.1)</span>
+              </button>
+            </div>
+
+            {/* Form Fields */}
+            <div className="flex flex-col gap-3.5 text-xs">
+              {/* App ID */}
+              <div>
+                <label className="block font-bold text-slate-700 mb-1">
+                  FYERS App ID <span className="text-rose-500">*</span>
+                </label>
+                <input
+                  type="text"
+                  value={tokenAppId}
+                  onChange={(e) => setTokenAppId(e.target.value)}
+                  placeholder="e.g. VX4SHQQSBA-100"
+                  className="w-full px-3 py-2 rounded-xl border border-slate-300 font-mono text-xs focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 bg-white"
+                />
+              </div>
+
+              {/* Secret Key */}
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="font-bold text-slate-700">
+                    Secret Key <span className="text-rose-500">*</span>
+                  </label>
+                  {authConfig?.hasSecretKey && !tokenSecretKey && (
+                    <span className="text-[11px] text-emerald-600 font-medium">✓ Saved in .env</span>
+                  )}
+                </div>
+                <div className="relative">
+                  <input
+                    type={showSecret ? "text" : "password"}
+                    value={tokenSecretKey}
+                    onChange={(e) => setTokenSecretKey(e.target.value)}
+                    placeholder={authConfig?.hasSecretKey ? "Using saved secret key (or enter new)" : "Enter Secret Key from Fyers"}
+                    className="w-full px-3 py-2 pr-10 rounded-xl border border-slate-300 font-mono text-xs focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 bg-white"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowSecret(!showSecret)}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 cursor-pointer"
+                  >
+                    {showSecret ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+
+              {/* Tab 1: 1-Click Browser OAuth */}
+              {authTab === '1click' && (
+                <div className="flex flex-col gap-3 pt-1">
+                  <div>
+                    <label className="block font-bold text-slate-700 mb-1">
+                      Redirect URI
+                    </label>
+                    <input
+                      type="text"
+                      value={tokenRedirectUri}
+                      onChange={(e) => setTokenRedirectUri(e.target.value)}
+                      className="w-full px-3 py-2 rounded-xl border border-slate-200 font-mono text-[11px] text-slate-600 bg-slate-50 focus:outline-none"
+                    />
+                    <p className="text-[10px] text-slate-500 mt-1 leading-normal">
+                      💡 Ensure this redirect URI is added in your <a href="https://myapi.fyers.in" target="_blank" rel="noreferrer" className="text-sky-600 underline">Fyers API Dashboard</a> for true 1-click automatic token generation.
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handle1ClickLogin}
+                    disabled={tokenLoading}
+                    className="mt-1 w-full py-2.5 rounded-xl font-bold text-sm text-white glossy-btn-sky flex items-center justify-center gap-2 cursor-pointer shadow-md disabled:opacity-60"
+                  >
+                    {tokenLoading ? (
+                      <span>Launching Fyers Login...</span>
+                    ) : (
+                      <>
+                        <Sparkles className="w-4 h-4" />
+                        <span>Login with FYERS (1-Click)</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              )}
+
+              {/* Tab 2: Manual Paste (for https://127.0.0.1) */}
+              {authTab === 'manual' && (
+                <div className="flex flex-col gap-3 pt-1">
+                  <div>
+                    <label className="block font-bold text-slate-700 mb-1">
+                      Paste Redirect URL or Auth Code
+                    </label>
+                    <input
+                      type="text"
+                      value={tokenAuthCode}
+                      onChange={(e) => setTokenAuthCode(e.target.value)}
+                      placeholder="Paste https://127.0.0.1/?auth_code=... or raw code"
+                      className="w-full px-3 py-2 rounded-xl border border-slate-300 font-mono text-xs focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 bg-white"
+                    />
+                    <p className="text-[10px] text-slate-500 mt-1 leading-normal">
+                      If your Fyers app redirect URI is set to <code className="bg-slate-100 px-1 py-0.5 rounded text-sky-800">https://127.0.0.1</code>, complete your login, copy the address bar URL, and paste it here.
+                    </p>
+                  </div>
+
+                  <label className="flex items-center gap-2 text-xs text-slate-600 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={saveSecretKey}
+                      onChange={(e) => setSaveSecretKey(e.target.checked)}
+                      className="rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                    />
+                    <span>Save Secret Key into .env file</span>
+                  </label>
+
+                  <button
+                    type="button"
+                    onClick={handleManualExchange}
+                    disabled={tokenLoading}
+                    className="mt-1 w-full py-2.5 rounded-xl font-bold text-sm text-white glossy-btn-emerald flex items-center justify-center gap-2 cursor-pointer shadow-md disabled:opacity-60"
+                  >
+                    {tokenLoading ? (
+                      <span>Exchanging Token...</span>
+                    ) : (
+                      <>
+                        <ShieldCheck className="w-4 h-4" />
+                        <span>Validate & Activate Token</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              )}
+
+              {/* Error Notification */}
+              {tokenError && (
+                <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-500 shrink-0 mt-0.5" />
+                  <span>{tokenError}</span>
+                </div>
+              )}
+
+              {/* Success Notification */}
+              {tokenSuccessMsg && (
+                <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs flex items-start gap-2">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  <span>{tokenSuccessMsg}</span>
+                </div>
+              )}
+            </div>
+
+          </div>
+        </div>
+      )}
 
     </div>
   );

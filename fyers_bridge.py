@@ -9,7 +9,9 @@ import sys
 import json
 import time
 import signal
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 # Ensure stdout is line-buffered for real-time piping to Node.js
 sys.stdout.reconfigure(line_buffering=True)
@@ -65,15 +67,15 @@ def emit_event(event_type, data):
 
 
 def format_timestamp(raw_ts):
-    """Convert exchange timestamp to readable string."""
+    """Convert exchange timestamp to IST readable string."""
     if raw_ts is None:
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
     try:
         if isinstance(raw_ts, (int, float)):
-            return datetime.fromtimestamp(raw_ts).strftime("%Y-%m-%d %H:%M:%S")
+            return datetime.fromtimestamp(raw_ts, tz=IST).strftime("%Y-%m-%d %H:%M:%S")
         return str(raw_ts)
     except Exception:
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def on_message(message):
@@ -114,8 +116,8 @@ def process_tick(data):
         date_str = dt_obj.strftime("%Y-%m-%d")
         time_str = dt_obj.strftime("%H:%M:%S")
     except Exception:
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        time_str = datetime.now().strftime("%H:%M:%S")
+        date_str = datetime.now(IST).strftime("%Y-%m-%d")
+        time_str = datetime.now(IST).strftime("%H:%M:%S")
 
     tick_data = {
         "symbol": symbol,

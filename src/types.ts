@@ -57,6 +57,8 @@ export interface CsvRecord {
   ask?: number;
   change?: number;
   pChange?: number;
+  tradeValue?: number;
+  spread?: number;
 }
 
 
