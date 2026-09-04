@@ -9,3 +9,7 @@ coverage/
 fyers_prices.csv
 __pycache__/
 *.pyc
+*.db
+*.db-shm
+*.db-wal
+backups/

@@ -1,14 +1,14 @@
 import React, { useState, useEffect, useRef } from 'react';
 import * as XLSX from 'xlsx';
-import { 
-  Play, 
-  Square, 
-  Trash2, 
-  Copy, 
-  Check, 
-  Terminal, 
-  ArrowUpRight, 
-  ArrowDownRight, 
+import {
+  Play,
+  Square,
+  Trash2,
+  Copy,
+  Check,
+  Terminal,
+  ArrowUpRight,
+  ArrowDownRight,
   Layers,
   Landmark,
   ChevronDown,
@@ -27,40 +27,51 @@ import {
   ExternalLink,
   Eye,
   EyeOff,
-  ShieldCheck,
   AlertCircle,
-  Sparkles
+  ShieldCheck,
+  Sparkles,
+  Activity,
+  SlidersHorizontal,
+  Zap,
+  TrendingUp,
+  Archive,
+  Database,
+  History
 } from 'lucide-react';
 import { LogEntry, SymbolSnapshot, CsvRecord } from './types';
+
+export interface BackupRecord {
+  id: string;
+  timestamp: string;
+  totalTicks: number;
+  totalBars1s?: number;
+  totalBars1m?: number;
+  dbFile: string;
+  xlsxFile: string;
+  csvFile: string;
+  dbSizeBytes?: number;
+  xlsxSizeBytes?: number;
+}
 import { NIFTY_500_SYMBOLS, StockSymbol } from './data/nifty500';
 import { BANK_NIFTY_SYMBOLS } from './data/banknifty';
+import { NIFTY_FUTURES_SYMBOLS } from './data/niftyfutures';
+import { StockScreener } from './components/StockScreener';
+import { TradingDashboard } from './components/TradingDashboard';
+import { ServerLogsViewer } from './components/ServerLogsViewer';
 
 export type AppTheme = 'sky' | 'emerald';
-
-const DEFAULT_SYMBOLS = [
-  "NSE:RELIANCE-EQ",
-  "NSE:TCS-EQ",
-  "NSE:HDFCBANK-EQ",
-  "NSE:INFY-EQ",
-  "NSE:ICICIBANK-EQ"
-];
 
 export default function App() {
   const [isRunning, setIsRunning] = useState<boolean>(false);
   const [status, setStatus] = useState<'idle' | 'connecting' | 'connected' | 'streaming' | 'stopped'>('idle');
-  const DEFAULT_BANK_NIFTY_SYMBOLS = [
-    "NSE:NIFTYBANK-INDEX",
-    "NSE:BANKNIFTY-FUT",
-    "NSE:HDFCBANK-EQ",
-    "NSE:ICICIBANK-EQ",
-    "NSE:AXISBANK-EQ"
-  ];
 
-  const [selectedNifty500Symbols, setSelectedNifty500Symbols] = useState<string[]>(DEFAULT_SYMBOLS);
-  const [selectedBankNiftySymbols, setSelectedBankNiftySymbols] = useState<string[]>(DEFAULT_BANK_NIFTY_SYMBOLS);
+  // All tickers unselected by default
+  const [selectedNifty500Symbols, setSelectedNifty500Symbols] = useState<string[]>([]);
+  const [selectedBankNiftySymbols, setSelectedBankNiftySymbols] = useState<string[]>([]);
+  const [selectedNiftyFuturesSymbols, setSelectedNiftyFuturesSymbols] = useState<string[]>([]);
 
   // Combined symbols for streaming & API request
-  const selectedSymbols = Array.from(new Set([...selectedNifty500Symbols, ...selectedBankNiftySymbols]));
+  const selectedSymbols = Array.from(new Set([...selectedNifty500Symbols, ...selectedBankNiftySymbols, ...selectedNiftyFuturesSymbols]));
   const [theme, setTheme] = useState<AppTheme>(() => {
     const saved = localStorage.getItem('fyers_app_theme');
     return saved === 'sky' ? 'sky' : 'emerald';
@@ -84,6 +95,8 @@ export default function App() {
   const [downloadMenuOpen, setDownloadMenuOpen] = useState<boolean>(false);
   const [granularity, setGranularity] = useState<'live' | '1s' | '1m'>('live');
   const [dbStats, setDbStats] = useState<{ totalRows: number; symbols: string[]; firstDate: string; lastDate: string; dbSizeBytes: number } | null>(null);
+  const [backups, setBackups] = useState<BackupRecord[]>([]);
+  const [showBackupsModal, setShowBackupsModal] = useState<boolean>(false);
 
   // Fyers Token Generator Modal States
   const [isTokenModalOpen, setIsTokenModalOpen] = useState<boolean>(false);
@@ -106,6 +119,24 @@ export default function App() {
   const [tokenSuccessMsg, setTokenSuccessMsg] = useState<string | null>(null);
   const [authTab, setAuthTab] = useState<'1click' | 'manual'>('1click');
 
+  // Primary Platform Navigation Tab: 'monitor' | 'screener' | 'trading' | 'logs'
+  const [platformTab, setPlatformTab] = useState<'monitor' | 'screener' | 'trading' | 'logs'>('monitor');
+  const [tradeTargetSymbol, setTradeTargetSymbol] = useState<string>('NSE:RELIANCE-EQ');
+  const [tradeTargetPrice, setTradeTargetPrice] = useState<number>(1310);
+
+  // Screener Interactivity Handlers
+  const handleAddFromScreener = (newSymbol: string) => {
+    if (!selectedSymbols.includes(newSymbol)) {
+      setSelectedNifty500Symbols(prev => [...prev, newSymbol]);
+    }
+  };
+
+  const handleSelectForTrade = (sym: string, curPrice: number) => {
+    setTradeTargetSymbol(sym);
+    setTradeTargetPrice(curPrice);
+    setPlatformTab('trading');
+  };
+
   // Nifty 500 Dropdown States
   const [isDropdownOpen, setIsDropdownOpen] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -116,11 +147,17 @@ export default function App() {
   const [bankNiftyQuery, setBankNiftyQuery] = useState<string>('');
   const [bankNiftySector, setBankNiftySector] = useState<string>('ALL');
 
+  // Nifty Futures Dropdown States
+  const [isNiftyFuturesOpen, setIsNiftyFuturesOpen] = useState<boolean>(false);
+  const [niftyFuturesQuery, setNiftyFuturesQuery] = useState<string>('');
+  const [niftyFuturesSector, setNiftyFuturesSector] = useState<string>('ALL');
+
   const terminalEndRef = useRef<HTMLDivElement | null>(null);
   const terminalContainerRef = useRef<HTMLDivElement | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
   const dropdownRef = useRef<HTMLDivElement | null>(null);
   const bankNiftyRef = useRef<HTMLDivElement | null>(null);
+  const niftyFuturesRef = useRef<HTMLDivElement | null>(null);
   const downloadMenuRef = useRef<HTMLDivElement | null>(null);
 
   // Close dropdowns on click outside
@@ -131,6 +168,9 @@ export default function App() {
       }
       if (bankNiftyRef.current && !bankNiftyRef.current.contains(event.target as Node)) {
         setIsBankNiftyOpen(false);
+      }
+      if (niftyFuturesRef.current && !niftyFuturesRef.current.contains(event.target as Node)) {
+        setIsNiftyFuturesOpen(false);
       }
       if (downloadMenuRef.current && !downloadMenuRef.current.contains(event.target as Node)) {
         setDownloadMenuOpen(false);
@@ -158,7 +198,7 @@ export default function App() {
         if (data.appId && !tokenAppId) setTokenAppId(data.appId);
         if (data.defaultRedirectUri && !tokenRedirectUri) setTokenRedirectUri(data.defaultRedirectUri);
       }
-    } catch {}
+    } catch { }
   };
 
   useEffect(() => {
@@ -182,15 +222,39 @@ export default function App() {
     return () => window.removeEventListener('message', handleMessage);
   }, []);
 
+  const fetchDbStats = async () => {
+    try {
+      const res = await fetch('/api/csv-files');
+      if (res.ok) setDbStats(await res.json());
+    } catch { }
+  };
+
+  const fetchBackups = async () => {
+    try {
+      const res = await fetch('/api/backups');
+      if (res.ok) {
+        const data = await res.json();
+        setBackups(data.backups || []);
+      }
+    } catch { }
+  };
+
+  const handleDownloadBackupFile = (filename: string) => {
+    const link = document.createElement('a');
+    link.href = `/api/backups/download/${encodeURIComponent(filename)}`;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
   useEffect(() => {
-    const fetchDbStats = async () => {
-      try {
-        const res = await fetch('/api/csv-files');
-        if (res.ok) setDbStats(await res.json());
-      } catch {}
-    };
     fetchDbStats();
-    const interval = setInterval(fetchDbStats, 10000);
+    fetchBackups();
+    const interval = setInterval(() => {
+      fetchDbStats();
+      fetchBackups();
+    }, 8000);
     return () => clearInterval(interval);
   }, []);
 
@@ -289,31 +353,70 @@ export default function App() {
     }
   };
 
-  const handleStart = () => {
+  const handleStart = async () => {
     if (isRunning) return;
+
+    if (selectedSymbols.length === 0) {
+      setLogs(prev => [
+        ...prev,
+        {
+          id: `warn-${Date.now()}`,
+          type: 'error',
+          rawText: `⚠️ No tickers selected. Please select at least one contract from the Nifty 500, Bank Nifty, or Nifty Futures dropdowns.`,
+          timestamp: new Date().toLocaleTimeString()
+        }
+      ]);
+      return;
+    }
 
     // Close any previous stream
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
+      eventSourceRef.current = null;
     }
 
     setIsRunning(true);
     setStatus('connecting');
     setTickCount(0);
     setCsvRecords([]);
+    setSnapshots({});
 
     const startTimestamp = new Date().toISOString().replace('T', ' ').substring(0, 19);
-    
-    // Add start log
-    setLogs(prev => [
-      ...prev,
-      {
-        id: `start-${Date.now()}`,
-        type: 'system',
-        rawText: `\n--- [${startTimestamp}] Starting WebSocket session (${selectedSymbols.length} symbols, ${granularity.toUpperCase()}) | SQLite logging enabled ---`,
-        timestamp: startTimestamp
+
+    // Call server to safely archive previous session data to backups/ and start fresh DB
+    let backupNotice: string | null = null;
+    try {
+      const res = await fetch('/api/session/start', { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.backup?.backedUp) {
+          backupNotice = `[BACKUP] Safely archived previous session (${data.backup.totalTicks?.toLocaleString() ?? 0} ticks) to backups/${data.backup.files?.xlsx || ''}`;
+        }
       }
-    ]);
+      fetchDbStats();
+      fetchBackups();
+    } catch (err) {
+      console.warn('Session archival error:', err);
+    }
+
+    // Initialize completely fresh terminal logs for the new session
+    const initialLogs: LogEntry[] = [];
+    if (backupNotice) {
+      initialLogs.push({
+        id: `backup-${Date.now()}`,
+        type: 'status',
+        rawText: backupNotice,
+        timestamp: startTimestamp,
+      });
+    }
+    initialLogs.push({
+      id: `start-${Date.now()}`,
+      type: 'system',
+      rawText: `\n--- [${startTimestamp}] Starting fresh session (${selectedSymbols.length} symbols, ${granularity.toUpperCase()}) | SQLite logging enabled ---`,
+      timestamp: startTimestamp,
+    });
+
+    setLogs(initialLogs);
 
     const symbolsParam = encodeURIComponent(selectedSymbols.join(','));
     const es = new EventSource(`/api/stream?symbols=${symbolsParam}&granularity=${granularity}`);
@@ -327,7 +430,7 @@ export default function App() {
         } else if (data.message.includes('Waiting for market data')) {
           setStatus('streaming');
         }
-        
+
         setLogs(prev => [
           ...prev,
           {
@@ -431,7 +534,7 @@ export default function App() {
       console.warn('SSE EventSource error:', err);
       console.warn('EventSource readyState:', es.readyState);
       console.warn('EventSource URL:', es.url);
-      
+
       // Add error log to UI
       setLogs(prev => [
         ...prev,
@@ -442,7 +545,7 @@ export default function App() {
           timestamp: new Date().toLocaleTimeString()
         }
       ]);
-      
+
       // Update status
       if (es.readyState === 2) {
         setStatus('stopped');
@@ -702,11 +805,11 @@ export default function App() {
 
   // Filter Nifty 500 list by search query & sector
   const filteredStockList = NIFTY_500_SYMBOLS.filter(stock => {
-    const matchesQuery = searchQuery === '' || 
+    const matchesQuery = searchQuery === '' ||
       stock.ticker.toLowerCase().includes(searchQuery.toLowerCase()) ||
       stock.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
       stock.symbol.toLowerCase().includes(searchQuery.toLowerCase());
-    
+
     const matchesSector = selectedSector === 'ALL' || stock.sector === selectedSector;
     return matchesQuery && matchesSector;
   });
@@ -715,16 +818,66 @@ export default function App() {
 
   // Filter Bank Nifty list by search query & sector
   const filteredBankNiftyList = BANK_NIFTY_SYMBOLS.filter(stock => {
-    const matchesQuery = bankNiftyQuery === '' || 
+    const matchesQuery = bankNiftyQuery === '' ||
       stock.ticker.toLowerCase().includes(bankNiftyQuery.toLowerCase()) ||
       stock.name.toLowerCase().includes(bankNiftyQuery.toLowerCase()) ||
       stock.symbol.toLowerCase().includes(bankNiftyQuery.toLowerCase());
-    
+
     const matchesSector = bankNiftySector === 'ALL' || stock.sector === bankNiftySector;
     return matchesQuery && matchesSector;
   });
 
   const availableBankNiftySectors = Array.from(new Set(BANK_NIFTY_SYMBOLS.map(s => s.sector).filter(Boolean))) as string[];
+
+  // Nifty Futures Selection Helpers
+  const selectedNiftyFuturesCount = selectedNiftyFuturesSymbols.length;
+  const isAllNiftyFuturesSelected = selectedNiftyFuturesCount === NIFTY_FUTURES_SYMBOLS.length;
+
+  const toggleNiftyFuturesSymbol = (sym: string) => {
+    if (isRunning) return;
+    setSelectedNiftyFuturesSymbols(prev => {
+      if (prev.includes(sym)) {
+        return prev.filter(s => s !== sym);
+      } else {
+        return Array.from(new Set([...prev, sym]));
+      }
+    });
+  };
+
+  const handleSelectAllNiftyFutures = () => {
+    if (isRunning) return;
+    const targetSyms = filteredNiftyFuturesList.map(s => s.symbol);
+    setSelectedNiftyFuturesSymbols(prev => Array.from(new Set([...prev, ...targetSyms])));
+  };
+
+  const handleUnselectAllNiftyFutures = () => {
+    if (isRunning) return;
+    const targetSet = new Set(filteredNiftyFuturesList.map(s => s.symbol));
+    setSelectedNiftyFuturesSymbols(prev => prev.filter(s => !targetSet.has(s)));
+  };
+
+  const handleSelectFuturesPreset = (type: 'INDEX' | 'STOCK') => {
+    if (isRunning) return;
+    if (type === 'INDEX') {
+      const idxSyms = NIFTY_FUTURES_SYMBOLS.filter(s => s.sector === 'Nifty Futures' || s.sector === 'Bank Nifty Futures' || s.sector === 'Index Futures' || s.sector === 'Index').map(s => s.symbol);
+      setSelectedNiftyFuturesSymbols(idxSyms);
+    } else {
+      const stockSyms = NIFTY_FUTURES_SYMBOLS.filter(s => s.sector === 'Stock Futures').map(s => s.symbol);
+      setSelectedNiftyFuturesSymbols(stockSyms);
+    }
+  };
+
+  const filteredNiftyFuturesList = NIFTY_FUTURES_SYMBOLS.filter(stock => {
+    const matchesQuery = niftyFuturesQuery === '' ||
+      stock.ticker.toLowerCase().includes(niftyFuturesQuery.toLowerCase()) ||
+      stock.name.toLowerCase().includes(niftyFuturesQuery.toLowerCase()) ||
+      stock.symbol.toLowerCase().includes(niftyFuturesQuery.toLowerCase());
+
+    const matchesSector = niftyFuturesSector === 'ALL' || stock.sector === niftyFuturesSector;
+    return matchesQuery && matchesSector;
+  });
+
+  const availableNiftyFuturesSectors = Array.from(new Set(NIFTY_FUTURES_SYMBOLS.map(s => s.sector).filter(Boolean))) as string[];
 
 
   // Cleanup on unmount
@@ -743,33 +896,159 @@ export default function App() {
 
   return (
     <div className={canvasClass}>
-      
-      {/* Top Header */}
-      <header className="border-b border-sky-200/80 bg-white/80 backdrop-blur-xl sticky top-0 z-30 px-4 lg:px-8 py-3.5 flex flex-wrap items-center justify-between gap-4 shadow-sm shadow-sky-200/40">
-        <div className="flex items-center gap-3">
-          <div className={`w-10 h-10 rounded-full flex items-center justify-center text-white shadow-lg shrink-0 ${
-            theme === 'emerald' ? 'glossy-orb-emerald shadow-emerald-500/40' : 'glossy-orb shadow-sky-400/40'
-          }`}>
-            <Terminal className="w-5 h-5 text-white drop-shadow-sm" />
+
+      {/* Top Header with Brand, Center Platform Tabs, and Right Actions (Token Active & Theme) */}
+      <header className="border-b border-sky-200/80 bg-white/85 backdrop-blur-xl sticky top-0 z-30 px-3 sm:px-6 lg:px-8 py-2.5 flex flex-wrap items-center justify-between gap-3 shadow-xs shadow-sky-200/40">
+        
+        {/* Brand / Logo */}
+        <div className="flex items-center gap-2.5 sm:gap-3 shrink-0">
+          <div className={`w-9 h-9 rounded-full flex items-center justify-center text-white shadow-lg shrink-0 ${theme === 'emerald' ? 'glossy-orb-emerald shadow-emerald-500/40' : 'glossy-orb shadow-sky-400/40'
+            }`}>
+            <Terminal className="w-4.5 h-4.5 text-white drop-shadow-sm" />
           </div>
           <div>
             <div className="flex items-center gap-2">
-              <h1 className="font-bold text-sky-950 text-base tracking-tight">
-                FYERS Live Price Monitor
+              <h1 className="font-bold text-sky-950 text-sm sm:text-base tracking-tight leading-tight">
+                AdwiKetan Trading Desk
               </h1>
-              <span className="web2-badge text-[10px] uppercase font-mono px-2.5 py-0.5 rounded-full text-sky-900 font-bold">
-                API V3 WebSocket
-              </span>
             </div>
-            <p className="text-xs text-sky-700/90 font-medium">
-              NSE Real-Time Market Feed & Live CSV Logger
+            <p className="text-[10px] sm:text-[11px] text-sky-700/90 font-medium leading-tight">
+              All in One Trading Solution
             </p>
           </div>
         </div>
 
-        {/* Live Status Indicator & CSV Status */}
-        <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
+        {/* Center: Primary Platform Tabs with Distinct Colors */}
+        <div className="p-1 rounded-2xl bg-slate-100/90 border border-slate-200/90 shadow-inner flex items-center gap-1.5 flex-wrap justify-center order-3 xl:order-none w-full xl:w-auto">
+          {/* Tab 1: Live Monitor (Sky/Blue Theme) */}
+          <button
+            type="button"
+            id="tab-live-monitor"
+            onClick={() => setPlatformTab('monitor')}
+            className={`px-3 py-1.5 sm:px-3.5 sm:py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+              platformTab === 'monitor'
+                ? 'bg-gradient-to-r from-sky-600 to-blue-600 text-white shadow-md shadow-sky-500/30 ring-1 ring-sky-400'
+                : 'bg-sky-50/90 hover:bg-sky-100/90 text-sky-900 border border-sky-200/80 shadow-2xs'
+            }`}
+          >
+            <Activity className="w-3.5 h-3.5" />
+            <span>Live Monitor</span>
 
+            {/* Embedded Live Status Button / Pill */}
+            <span
+              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] sm:text-[10px] font-mono font-bold tracking-tight transition-all shadow-xs ${
+                status === 'streaming'
+                  ? platformTab === 'monitor'
+                    ? 'bg-emerald-500 text-white shadow-xs'
+                    : 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                  : status === 'connecting' || status === 'connected'
+                  ? platformTab === 'monitor'
+                    ? 'bg-amber-400 text-sky-950'
+                    : 'bg-amber-100 text-amber-800 border border-amber-300'
+                  : status === 'stopped'
+                  ? platformTab === 'monitor'
+                    ? 'bg-rose-500 text-white'
+                    : 'bg-rose-100 text-rose-800 border border-rose-300'
+                  : platformTab === 'monitor'
+                  ? 'bg-sky-800/80 text-sky-100'
+                  : 'bg-sky-100 text-sky-800 border border-sky-200'
+              }`}
+            >
+              <span className="relative flex h-1.5 w-1.5">
+                {isRunning && (
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-current opacity-75"></span>
+                )}
+                <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-current"></span>
+              </span>
+              <span className="uppercase">
+                {status === 'streaming'
+                  ? `Live (${tickCount.toLocaleString()})`
+                  : status === 'connecting'
+                  ? 'Connecting...'
+                  : status === 'connected'
+                  ? 'Connected'
+                  : status === 'stopped'
+                  ? 'Stopped'
+                  : 'Ready'}
+              </span>
+            </span>
+          </button>
+
+          {/* Tab 2: Stock Screener (Purple/Violet Theme) */}
+          <button
+            type="button"
+            id="tab-stock-screener"
+            onClick={() => setPlatformTab('screener')}
+            className={`px-3 py-1.5 sm:px-3.5 sm:py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+              platformTab === 'screener'
+                ? 'bg-gradient-to-r from-purple-600 to-indigo-600 text-white shadow-md shadow-purple-500/30 ring-1 ring-purple-400'
+                : 'bg-purple-50/90 hover:bg-purple-100/90 text-purple-900 border border-purple-200/80 shadow-2xs'
+            }`}
+          >
+            <SlidersHorizontal className="w-3.5 h-3.5" />
+            <span>Stock Screener</span>
+            <span
+              className={`px-1.5 py-0.2 rounded-full text-[9px] sm:text-[10px] font-mono font-bold ${
+                platformTab === 'screener'
+                  ? 'bg-purple-900/60 text-purple-100 border border-purple-400/40'
+                  : 'bg-purple-200/70 text-purple-950 border border-purple-300/80'
+              }`}
+            >
+              NIFTY 500
+            </span>
+          </button>
+
+          {/* Tab 3: Trading Dashboard (Emerald/Teal Theme) */}
+          <button
+            type="button"
+            id="tab-trading"
+            onClick={() => setPlatformTab('trading')}
+            className={`px-3 py-1.5 sm:px-3.5 sm:py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+              platformTab === 'trading'
+                ? 'bg-gradient-to-r from-emerald-600 to-teal-600 text-white shadow-md shadow-emerald-500/30 ring-1 ring-emerald-400'
+                : 'bg-emerald-50/90 hover:bg-emerald-100/90 text-emerald-950 border border-emerald-200/80 shadow-2xs'
+            }`}
+          >
+            <Zap className="w-3.5 h-3.5" />
+            <span>Trading</span>
+            <span
+              className={`px-1.5 py-0.2 rounded-full text-[9px] sm:text-[10px] font-mono font-bold ${
+                platformTab === 'trading'
+                  ? 'bg-emerald-900/60 text-emerald-100 border border-emerald-400/40'
+                  : 'bg-emerald-200/70 text-emerald-950 border border-emerald-300/80'
+              }`}
+            >
+              PAPER / LIVE
+            </span>
+          </button>
+
+          {/* Tab 4: Server Logs (Dark Charcoal / Slate & Amber Theme) */}
+          <button
+            type="button"
+            id="tab-server-logs"
+            onClick={() => setPlatformTab('logs')}
+            className={`px-3 py-1.5 sm:px-3.5 sm:py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+              platformTab === 'logs'
+                ? 'bg-gradient-to-r from-slate-800 to-slate-950 text-amber-300 shadow-md shadow-slate-900/35 ring-1 ring-amber-500/50'
+                : 'bg-slate-50 hover:bg-slate-200/90 text-slate-800 border border-slate-300/80 shadow-2xs'
+            }`}
+          >
+            <Terminal className="w-3.5 h-3.5" />
+            <span>Logs</span>
+            <span
+              className={`px-1.5 py-0.2 rounded-full text-[9px] sm:text-[10px] font-mono font-bold ${
+                platformTab === 'logs'
+                  ? 'bg-amber-400/20 text-amber-300 border border-amber-500/40'
+                  : 'bg-slate-200 text-slate-700 border border-slate-300'
+              }`}
+            >
+              SERVER
+            </span>
+          </button>
+        </div>
+
+        {/* Header Right: Token Active Button & Theme Toggle */}
+        <div className="flex items-center gap-2 sm:gap-2.5 shrink-0">
           {/* Fyers Auth / Token Button */}
           <button
             id="btn-fyers-auth"
@@ -777,11 +1056,10 @@ export default function App() {
               fetchAuthConfig();
               setIsTokenModalOpen(true);
             }}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-mono font-bold transition-all cursor-pointer shadow-xs ${
-              authConfig?.hasToken
-                ? 'bg-emerald-50 text-emerald-800 border border-emerald-300 hover:bg-emerald-100 hover:border-emerald-400'
-                : 'bg-amber-50 text-amber-900 border border-amber-300 hover:bg-amber-100 animate-pulse'
-            }`}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-mono font-bold transition-all cursor-pointer shadow-xs ${authConfig?.hasToken
+              ? 'bg-emerald-50 text-emerald-800 border border-emerald-300 hover:bg-emerald-100 hover:border-emerald-400'
+              : 'bg-amber-50 text-amber-900 border border-amber-300 hover:bg-amber-100 animate-pulse'
+              }`}
             title="Generate or update daily FYERS access token"
           >
             <Key className="w-3.5 h-3.5 text-current" />
@@ -790,46 +1068,16 @@ export default function App() {
             </span>
           </button>
 
-          {/* DB Stats Badge */}
-          <div className="web2-badge flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs text-sky-900 font-mono font-medium">
-            <FileSpreadsheet className={`w-3.5 h-3.5 ${isRunning ? 'text-sky-600 animate-pulse' : 'text-sky-500'}`} />
-            <span className="text-[11px]">
-              DB: <span className="font-bold text-sky-950">{dbStats?.totalRows?.toLocaleString() ?? '—'}</span> ticks
-              {dbStats?.dbSizeBytes ? <span className="ml-1 opacity-70">({(dbStats.dbSizeBytes / 1024).toFixed(0)}KB)</span> : null}
-            </span>
-          </div>
-
-          {/* Connection State Badge */}
-          <div className="web2-badge flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs font-mono">
-            <span className="relative flex h-2.5 w-2.5">
-              {isRunning && (
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-500 opacity-75"></span>
-              )}
-              <span className={`relative inline-flex rounded-full h-2.5 w-2.5 ${
-                status === 'streaming' ? 'bg-emerald-500 shadow-sm shadow-emerald-400' :
-                status === 'connecting' || status === 'connected' ? 'bg-amber-400' :
-                status === 'stopped' ? 'bg-rose-500' : 'bg-slate-400'
-              }`}></span>
-            </span>
-            <span className="uppercase text-[11px] font-bold text-sky-900">
-              {status === 'streaming' ? `Streaming (${tickCount} ticks)` :
-               status === 'connecting' ? 'Connecting...' :
-               status === 'connected' ? 'Connected' :
-               status === 'stopped' ? 'Stopped' : 'Ready'}
-            </span>
-          </div>
-
           {/* 2-Way Theme Toggle Switch */}
           <div className="web2-badge p-1 rounded-xl flex items-center gap-1 bg-white/90 shadow-inner border border-sky-200/60">
             <button
               type="button"
               id="btn-theme-emerald"
               onClick={() => handleThemeChange('emerald')}
-              className={`p-1.5 rounded-lg text-xs font-bold transition-all flex items-center justify-center cursor-pointer ${
-                theme === 'emerald'
-                  ? 'bg-emerald-600 text-white shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100/60'
-              }`}
+              className={`p-1.5 rounded-lg text-xs font-bold transition-all flex items-center justify-center cursor-pointer ${theme === 'emerald'
+                ? 'bg-emerald-600 text-white shadow-xs'
+                : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100/60'
+                }`}
               title="Emerald Theme"
               aria-label="Emerald Theme"
             >
@@ -839,11 +1087,10 @@ export default function App() {
               type="button"
               id="btn-theme-sky"
               onClick={() => handleThemeChange('sky')}
-              className={`p-1.5 rounded-lg text-xs font-bold transition-all flex items-center justify-center cursor-pointer ${
-                theme === 'sky'
-                  ? 'bg-sky-600 text-white shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100/60'
-              }`}
+              className={`p-1.5 rounded-lg text-xs font-bold transition-all flex items-center justify-center cursor-pointer ${theme === 'sky'
+                ? 'bg-sky-600 text-white shadow-xs'
+                : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100/60'
+                }`}
               title="Sky Theme"
               aria-label="Sky Theme"
             >
@@ -856,953 +1103,1323 @@ export default function App() {
       {/* Main Content Area - Full Screen Layout */}
       <main className="flex-1 w-full max-w-none px-4 sm:px-6 lg:px-8 py-4 sm:py-6 flex flex-col gap-6">
 
-        {/* Top Control Bar with Primary Run / Stop / CSV Download Buttons */}
-        <section className={`web2-card rounded-2xl md:rounded-3xl p-4 sm:p-5 flex flex-col md:flex-row items-start md:items-center justify-between gap-4 relative transition-all ${
-          isDropdownOpen || isBankNiftyOpen ? 'z-50' : 'z-20'
-        }`}>
-          
-          {/* Action Buttons: Run, Stop, Download CSV */}
-          <div className="flex items-center gap-3 w-full sm:w-auto flex-wrap">
-            <button
-              id="btn-run"
-              onClick={handleStart}
-              disabled={isRunning}
-              className={`flex-1 sm:flex-none flex items-center justify-center gap-2 px-6 py-2.5 rounded-xl font-bold text-sm transition-all ${
-                isRunning
+        {platformTab === 'monitor' && (
+          <>
+
+            {/* Top Control Bar with Primary Run / Stop / CSV Download Buttons & Live Stats on Top Right */}
+            <section className={`web2-card rounded-2xl md:rounded-3xl px-4 py-3 sm:px-5 sm:py-3.5 flex items-center gap-2.5 sm:gap-3 flex-wrap relative transition-all ${isDropdownOpen || isBankNiftyOpen || isNiftyFuturesOpen ? 'z-50' : 'z-20'
+              }`}>
+
+              {/* Granularity Dropdown (Left of Run) */}
+              <div className="flex items-center gap-1.5 bg-white/90 border border-sky-200/80 rounded-xl px-3 py-2 shadow-xs">
+                <Clock className="w-3.5 h-3.5 text-sky-600" />
+                <span className="text-[10px] font-bold text-sky-900 uppercase font-mono tracking-wider">
+                  Timeframe:
+                </span>
+                <select
+                  id="select-granularity"
+                  value={granularity}
+                  onChange={(e) => setGranularity(e.target.value as 'live' | '1s' | '1m')}
+                  disabled={isRunning}
+                  className={`bg-transparent text-xs font-mono font-bold text-sky-950 focus:outline-none cursor-pointer ${isRunning ? 'opacity-60 cursor-not-allowed' : ''
+                    }`}
+                >
+                  <option value="live">Live (Tick-by-Tick)</option>
+                  <option value="1s">1-Second Bars</option>
+                  <option value="1m">1-Minute Bars</option>
+                </select>
+              </div>
+
+              {/* Run Button */}
+              <button
+                id="btn-run"
+                onClick={handleStart}
+                disabled={isRunning}
+                className={`flex-none flex items-center justify-center gap-1.5 px-4 sm:px-5 py-2 rounded-xl font-bold text-xs sm:text-sm transition-all ${isRunning
                   ? 'bg-slate-200 text-slate-400 cursor-not-allowed border border-slate-300'
                   : 'glossy-btn-emerald text-white cursor-pointer'
-              }`}
-            >
-              <Play className="w-4 h-4 fill-current drop-shadow-sm" />
-              <span>Run</span>
-            </button>
-
-            <button
-              id="btn-stop"
-              onClick={handleStop}
-              disabled={!isRunning}
-              className={`flex-1 sm:flex-none flex items-center justify-center gap-2 px-6 py-2.5 rounded-xl font-bold text-sm transition-all ${
-                !isRunning
-                  ? 'bg-slate-200 text-slate-400 cursor-not-allowed border border-slate-300'
-                  : 'glossy-btn-rose text-white cursor-pointer'
-              }`}
-            >
-              <Square className="w-4 h-4 fill-current drop-shadow-sm" />
-              <span>Stop</span>
-            </button>
-
-            {/* Granularity Dropdown */}
-            <div className="flex items-center gap-1.5 bg-white/90 border border-sky-200/80 rounded-xl px-3 py-2 shadow-xs">
-              <Clock className="w-3.5 h-3.5 text-sky-600" />
-              <span className="text-[10px] font-bold text-sky-900 uppercase font-mono tracking-wider">
-                Granularity:
-              </span>
-              <select
-                id="select-granularity"
-                value={granularity}
-                onChange={(e) => setGranularity(e.target.value as 'live' | '1s' | '1m')}
-                disabled={isRunning}
-                className={`bg-transparent text-xs font-mono font-bold text-sky-950 focus:outline-none cursor-pointer ${
-                  isRunning ? 'opacity-60 cursor-not-allowed' : ''
-                }`}
+                  }`}
               >
-                <option value="live">Live (Tick-by-Tick)</option>
-                <option value="1s">1-Second Bars</option>
-                <option value="1m">1-Minute Bars</option>
-              </select>
-            </div>
-
-            {/* Download Dropdown Button */}
-            <div className="relative" ref={downloadMenuRef}>
-              <button
-                id="btn-download-menu"
-                onClick={() => setDownloadMenuOpen(!downloadMenuOpen)}
-                className="flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl font-bold text-xs transition-all glossy-btn-cyan text-white cursor-pointer hover:brightness-105"
-                title="Download recorded prices as XLSX"
-              >
-                {downloadSuccess ? (
-                  <>
-                    <Check className="w-4 h-4 text-white" />
-                    <span>Downloaded!</span>
-                  </>
-                ) : (
-                  <>
-                    <Download className="w-4 h-4" />
-                    <span>Download</span>
-                    {(dbStats?.totalRows ?? 0) > 0 && (
-                      <span className="ml-0.5 px-1.5 py-0.2 rounded-full bg-white/30 text-white text-[10px] font-mono font-extrabold">
-                        {dbStats!.totalRows.toLocaleString()}
-                      </span>
-                    )}
-                    <ChevronDown className={`w-3.5 h-3.5 transition-transform ${downloadMenuOpen ? 'rotate-180' : ''}`} />
-                  </>
-                )}
+                <Play className="w-4 h-4 fill-current drop-shadow-sm" />
+                <span>Run</span>
               </button>
 
-              {/* Download Format Popover Menu */}
-              {downloadMenuOpen && (
-                <div className="absolute left-0 mt-2 z-50 w-72 web2-card p-2 rounded-2xl shadow-2xl border border-sky-300/90 bg-white/98 backdrop-blur-2xl animate-in fade-in slide-in-from-top-2 duration-150">
-                  <div className="px-3 py-1.5 text-[10px] uppercase font-mono tracking-wider font-bold text-sky-800 border-b border-sky-100 mb-1">
-                    Export Data
-                  </div>
-
-                  {/* Full DB export */}
-                  <button
-                    onClick={() => handleDownloadFromDb()}
-                    className="w-full flex items-center gap-3 px-3 py-2 rounded-xl text-left hover:bg-emerald-50 text-emerald-950 transition-colors cursor-pointer group"
-                  >
-                    <div className="p-2 rounded-lg bg-emerald-100 text-emerald-700 group-hover:bg-emerald-600 group-hover:text-white transition-colors">
-                      <FileSpreadsheet className="w-4 h-4" />
-                    </div>
-                    <div>
-                      <div className="font-bold text-xs">Full DB Export (.xlsx)</div>
-                      <div className="text-[10px] text-emerald-700 font-mono">
-                        {dbStats ? `${dbStats.totalRows.toLocaleString()} rows · ${dbStats.firstDate ?? ''} → ${dbStats.lastDate ?? ''}` : 'All ticks from SQLite'}
-                      </div>
-                    </div>
-                  </button>
-
-                  {/* Session CSV */}
-                  <button
-                    onClick={handleDownloadCsv}
-                    disabled={csvRecords.length === 0}
-                    className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-left transition-colors group ${
-                      csvRecords.length === 0 ? 'opacity-40 cursor-not-allowed' : 'hover:bg-sky-50 text-sky-950 cursor-pointer'
-                    }`}
-                  >
-                    <div className="p-2 rounded-lg bg-sky-100 text-sky-700 group-hover:bg-sky-600 group-hover:text-white transition-colors">
-                      <FileCode2 className="w-4 h-4" />
-                    </div>
-                    <div>
-                      <div className="font-bold text-xs">Session CSV (.csv)</div>
-                      <div className="text-[10px] text-sky-700 font-mono">{csvRecords.length} rows this session</div>
-                    </div>
-                  </button>
-
-                  {/* Session Excel */}
-                  <button
-                    onClick={handleDownloadExcel}
-                    disabled={csvRecords.length === 0}
-                    className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-left transition-colors group ${
-                      csvRecords.length === 0 ? 'opacity-40 cursor-not-allowed' : 'hover:bg-violet-50 text-violet-950 cursor-pointer'
-                    }`}
-                  >
-                    <div className="p-2 rounded-lg bg-violet-100 text-violet-700 group-hover:bg-violet-600 group-hover:text-white transition-colors">
-                      <FileSpreadsheet className="w-4 h-4" />
-                    </div>
-                    <div>
-                      <div className="font-bold text-xs">Session Excel (.xlsx)</div>
-                      <div className="text-[10px] text-violet-700 font-mono">{csvRecords.length} rows this session</div>
-                    </div>
-                  </button>
-                </div>
-              )}
-            </div>
-
-            <div className="h-6 w-px bg-sky-200/80 hidden sm:block mx-0.5" />
-
-            <button
-              id="btn-clear"
-              onClick={handleClear}
-              className="p-2.5 rounded-xl text-sky-800 hover:text-sky-950 web2-badge hover:brightness-105 transition-all"
-              title="Clear terminal output"
-            >
-              <Trash2 className="w-4 h-4" />
-            </button>
-
-            <button
-              id="btn-copy"
-              onClick={handleCopyLogs}
-              className="p-2.5 rounded-xl text-sky-800 hover:text-sky-950 web2-badge hover:brightness-105 transition-all flex items-center gap-1.5 text-xs font-semibold"
-              title="Copy output to clipboard"
-            >
-              {copied ? <Check className="w-4 h-4 text-emerald-600" /> : <Copy className="w-4 h-4" />}
-              <span className="hidden sm:inline">{copied ? 'Copied' : 'Copy'}</span>
-            </button>
-          </div>
-
-          {/* Nifty 500 Dropdown & Controls */}
-          <div className="flex flex-wrap items-center gap-2.5 text-xs relative z-50" ref={dropdownRef}>
-            <span className="text-sky-950 font-bold flex items-center gap-1.5 mr-0.5">
-              <Layers className="w-4 h-4 text-sky-600" />
-              <span>Nifty 500:</span>
-            </span>
-
-            {/* Nifty 500 Toggle Button */}
-            <button
-              type="button"
-              id="btn-nifty500-dropdown"
-              onClick={() => !isRunning && setIsDropdownOpen(!isDropdownOpen)}
-              disabled={isRunning}
-              className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition-all web2-badge shadow-sm hover:brightness-105 cursor-pointer ${
-                isRunning ? 'opacity-70 cursor-not-allowed' : ''
-              }`}
-            >
-              <span className="text-sky-950">
-                {selectedNifty500Count === NIFTY_500_SYMBOLS.length
-                  ? 'All Nifty 500 Selected'
-                  : selectedNifty500Count === 0
-                  ? 'Select Nifty 500'
-                  : `${selectedNifty500Count} / 500 Selected`}
-              </span>
-              <span className="px-1.5 py-0.5 rounded-full bg-sky-200/70 text-sky-950 text-[10px] font-mono">
-                {selectedNifty500Count}
-              </span>
-              {isDropdownOpen ? (
-                <ChevronUp className="w-3.5 h-3.5 text-sky-700" />
-              ) : (
-                <ChevronDown className="w-3.5 h-3.5 text-sky-700" />
-              )}
-            </button>
-
-            {/* Expanded Nifty 500 Dropdown Panel */}
-            {isDropdownOpen && (
-              <div className="absolute top-full left-0 mt-2 z-50 w-full sm:w-[500px] md:w-[600px] max-w-[calc(100vw-2rem)] web2-card p-4 rounded-2xl shadow-2xl border border-sky-300/90 bg-white/98 backdrop-blur-2xl animate-in fade-in slide-in-from-top-2 duration-150">
-                
-                {/* Search Bar & Clear Search */}
-                <div className="flex items-center gap-2 mb-3">
-                  <div className="relative flex-1">
-                    <Search className="w-4 h-4 text-sky-500 absolute left-3 top-1/2 -translate-y-1/2" />
-                    <input
-                      type="text"
-                      value={searchQuery}
-                      onChange={(e) => setSearchQuery(e.target.value)}
-                      placeholder="Search Nifty 500 (e.g., RELIANCE, TCS, Bank, Tata)..."
-                      className="w-full pl-9 pr-8 py-2 rounded-xl bg-sky-50/80 border border-sky-200 text-xs font-medium text-sky-950 placeholder:text-sky-400 focus:outline-none focus:ring-2 focus:ring-sky-400"
-                    />
-                    {searchQuery && (
-                      <button
-                        onClick={() => setSearchQuery('')}
-                        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-sky-400 hover:text-sky-700 p-0.5"
-                      >
-                        <X className="w-3.5 h-3.5" />
-                      </button>
-                    )}
-                  </div>
-
-                  {/* Sector Filter Dropdown */}
-                  <select
-                    value={selectedSector}
-                    onChange={(e) => setSelectedSector(e.target.value)}
-                    className="px-2.5 py-2 rounded-xl bg-sky-50/80 border border-sky-200 text-xs font-semibold text-sky-900 focus:outline-none focus:ring-2 focus:ring-sky-400 cursor-pointer"
-                  >
-                    <option value="ALL">All Sectors</option>
-                    {availableSectors.map(sec => (
-                      <option key={sec} value={sec}>{sec}</option>
-                    ))}
-                  </select>
-                </div>
-
-                {/* Quick Select All, Unselect All & Presets */}
-                <div className="flex flex-wrap items-center justify-between gap-2 pb-2.5 mb-2 border-b border-sky-100 text-[11px]">
-                  <div className="flex items-center gap-1.5 flex-wrap">
-                    <button
-                      type="button"
-                      id="btn-select-all-nifty500"
-                      onClick={handleSelectAllNifty500}
-                      disabled={isRunning}
-                      className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold glossy-btn-cyan text-white shadow-xs cursor-pointer hover:opacity-95"
-                      title="Select all Nifty 500 symbols"
-                    >
-                      <CheckSquare className="w-3.5 h-3.5 text-white" />
-                      <span>Select All</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      id="btn-unselect-all-nifty500"
-                      onClick={handleUnselectAllNifty500}
-                      disabled={isRunning}
-                      className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200/80 cursor-pointer"
-                      title="Unselect all Nifty 500 symbols"
-                    >
-                      <XCircle className="w-3.5 h-3.5 text-rose-500" />
-                      <span>Unselect All</span>
-                    </button>
-
-                    <div className="h-4 w-px bg-sky-200 mx-0.5"></div>
-
-                    <span className="font-bold text-sky-900">Presets:</span>
-                    <button
-                      onClick={() => handleSelectPreset('TOP_5')}
-                      className="px-2 py-0.5 rounded-lg bg-emerald-100/80 hover:bg-emerald-200 text-emerald-950 font-bold border border-emerald-300/80 cursor-pointer"
-                    >
-                      Top 5
-                    </button>
-                    <button
-                      onClick={() => handleSelectPreset('TOP_10')}
-                      className="px-2 py-0.5 rounded-lg bg-emerald-100/80 hover:bg-emerald-200 text-emerald-950 font-bold border border-emerald-300/80 cursor-pointer"
-                    >
-                      Top 10
-                    </button>
-                    <button
-                      onClick={() => handleSelectPreset('TOP_20')}
-                      className="px-2 py-0.5 rounded-lg bg-emerald-100/80 hover:bg-emerald-200 text-emerald-950 font-bold border border-emerald-300/80 cursor-pointer"
-                    >
-                      Top 20
-                    </button>
-                    <button
-                      onClick={() => handleSelectPreset('NIFTY_50')}
-                      className="px-2 py-0.5 rounded-lg bg-sky-100 hover:bg-sky-200 text-sky-900 font-semibold cursor-pointer"
-                    >
-                      Nifty 50
-                    </button>
-                    <button
-                      onClick={() => handleSelectPreset('TOP_100')}
-                      className="px-2 py-0.5 rounded-lg bg-sky-100 hover:bg-sky-200 text-sky-900 font-semibold cursor-pointer"
-                    >
-                      Top 100
-                    </button>
-                    <button
-                      onClick={() => handleSelectPreset('BANKING')}
-                      className="px-2 py-0.5 rounded-lg bg-sky-100 hover:bg-sky-200 text-sky-900 font-semibold cursor-pointer"
-                    >
-                      Banking
-                    </button>
-                    <button
-                      onClick={() => handleSelectPreset('IT')}
-                      className="px-2 py-0.5 rounded-lg bg-sky-100 hover:bg-sky-200 text-sky-900 font-semibold cursor-pointer"
-                    >
-                      IT
-                    </button>
-                  </div>
-
-                  <span className="text-[11px] font-mono text-sky-700 font-semibold">
-                    {filteredStockList.length} matches
-                  </span>
-                </div>
-
-                {/* Scrollable Symbol List with Select Boxes */}
-                <div className="max-h-64 overflow-y-auto space-y-1.5 pr-1 text-xs">
-                  {filteredStockList.length === 0 ? (
-                    <div className="p-6 text-center text-sky-600 font-medium text-xs">
-                      No symbols match "{searchQuery}"
-                    </div>
-                  ) : (
-                    filteredStockList.map((stock, idx) => {
-                      const isChecked = selectedNifty500Symbols.includes(stock.symbol);
-                      return (
-                        <div
-                          key={`${stock.symbol}-${idx}`}
-                          onClick={() => toggleNifty500Symbol(stock.symbol)}
-                          className={`flex items-center justify-between p-2 rounded-xl transition-all cursor-pointer select-none border ${
-                            isChecked
-                              ? 'bg-sky-100/80 border-sky-300/80 text-sky-950 font-semibold shadow-xs'
-                              : 'bg-white/60 hover:bg-sky-50/80 border-sky-100/60 text-slate-700'
-                          }`}
-                        >
-                          <div className="flex items-center gap-2.5 min-w-0">
-                            <input
-                              type="checkbox"
-                              checked={isChecked}
-                              onChange={() => {}} // handled by parent div onClick
-                              className="w-4 h-4 rounded border-sky-300 text-sky-600 focus:ring-sky-400 cursor-pointer accent-sky-600"
-                            />
-                            <span className="font-mono font-bold text-sky-950 text-xs w-28 shrink-0">
-                              {stock.ticker}
-                            </span>
-                            <span className="truncate text-sky-900 text-[11px]">
-                              {stock.name}
-                            </span>
-                          </div>
-
-                          {stock.sector && (
-                            <span className="text-[10px] font-medium text-sky-700 bg-sky-200/50 px-2 py-0.5 rounded-md shrink-0 ml-2">
-                              {stock.sector}
-                            </span>
-                          )}
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-
-                {/* Dropdown Footer */}
-                <div className="mt-3 pt-2.5 border-t border-sky-100 flex items-center justify-between text-xs">
-                  <span className="font-semibold text-sky-950">
-                    {selectedNifty500Count} of {NIFTY_500_SYMBOLS.length} Nifty 500 Selected
-                  </span>
-                  <button
-                    onClick={() => setIsDropdownOpen(false)}
-                    className="glossy-btn-cyan text-white px-4 py-1.5 rounded-xl font-bold text-xs cursor-pointer"
-                  >
-                    Done
-                  </button>
-                </div>
-
-              </div>
-            )}
-          </div>
-
-          {/* Bank Nifty Dropdown & Separate Controls */}
-          <div className="flex flex-wrap items-center gap-2.5 text-xs relative z-50" ref={bankNiftyRef}>
-            <span className="text-sky-950 font-bold flex items-center gap-1.5 mr-0.5">
-              <Landmark className="w-4 h-4 text-emerald-600" />
-              <span>Bank Nifty:</span>
-            </span>
-
-            {/* Bank Nifty Toggle Button */}
-            <button
-              type="button"
-              id="btn-banknifty-dropdown"
-              onClick={() => !isRunning && setIsBankNiftyOpen(!isBankNiftyOpen)}
-              disabled={isRunning}
-              className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition-all web2-badge shadow-sm hover:brightness-105 cursor-pointer ${
-                isRunning ? 'opacity-70 cursor-not-allowed' : ''
-              }`}
-            >
-              <span className="text-sky-950">
-                {selectedBankNiftyCount === BANK_NIFTY_SYMBOLS.length
-                  ? 'All Bank Nifty Selected'
-                  : selectedBankNiftyCount === 0
-                  ? 'Select Bank Nifty'
-                  : `${selectedBankNiftyCount} / ${BANK_NIFTY_SYMBOLS.length} Selected`}
-              </span>
-              <span className="px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-950 text-[10px] font-mono border border-emerald-300/80">
-                {selectedBankNiftyCount}
-              </span>
-              {isBankNiftyOpen ? (
-                <ChevronUp className="w-3.5 h-3.5 text-sky-700" />
-              ) : (
-                <ChevronDown className="w-3.5 h-3.5 text-sky-700" />
-              )}
-            </button>
-
-            {/* Expanded Bank Nifty Dropdown Panel */}
-            {isBankNiftyOpen && (
-              <div className="absolute top-full left-0 sm:right-0 sm:left-auto mt-2 z-50 w-full sm:w-[500px] md:w-[600px] max-w-[calc(100vw-2rem)] web2-card p-4 rounded-2xl shadow-2xl border border-emerald-300/90 bg-white/98 backdrop-blur-2xl animate-in fade-in slide-in-from-top-2 duration-150">
-                
-                {/* Search Bar & Clear Search */}
-                <div className="flex items-center gap-2 mb-3">
-                  <div className="relative flex-1">
-                    <Search className="w-4 h-4 text-emerald-600 absolute left-3 top-1/2 -translate-y-1/2" />
-                    <input
-                      type="text"
-                      value={bankNiftyQuery}
-                      onChange={(e) => setBankNiftyQuery(e.target.value)}
-                      placeholder="Search Bank Nifty (e.g. NIFTYBANK, HDFCBANK, FUT, 50000CE)..."
-                      className="w-full pl-9 pr-8 py-2 rounded-xl bg-emerald-50/60 border border-emerald-200 text-xs font-medium text-sky-950 placeholder:text-sky-400 focus:outline-none focus:ring-2 focus:ring-emerald-400"
-                    />
-                    {bankNiftyQuery && (
-                      <button
-                        onClick={() => setBankNiftyQuery('')}
-                        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-sky-400 hover:text-sky-700 p-0.5"
-                      >
-                        <X className="w-3.5 h-3.5" />
-                      </button>
-                    )}
-                  </div>
-
-                  {/* Sector Filter Dropdown */}
-                  <select
-                    value={bankNiftySector}
-                    onChange={(e) => setBankNiftySector(e.target.value)}
-                    className="px-2.5 py-2 rounded-xl bg-emerald-50/60 border border-emerald-200 text-xs font-semibold text-emerald-950 focus:outline-none focus:ring-2 focus:ring-emerald-400 cursor-pointer"
-                  >
-                    <option value="ALL">All Categories</option>
-                    {availableBankNiftySectors.map(sec => (
-                      <option key={sec} value={sec}>{sec}</option>
-                    ))}
-                  </select>
-                </div>
-
-                {/* Info & Dedicated Buttons Header */}
-                <div className="flex items-center justify-between pb-2 mb-2 border-b border-emerald-100 text-[11px]">
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      type="button"
-                      id="btn-select-all-banknifty"
-                      onClick={handleSelectAllBankNifty}
-                      disabled={isRunning}
-                      className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs cursor-pointer"
-                      title="Select all Bank Nifty symbols"
-                    >
-                      <CheckSquare className="w-3.5 h-3.5 text-white" />
-                      <span>Select All</span>
-                    </button>
-
-                    <button
-                      type="button"
-                      id="btn-unselect-all-banknifty"
-                      onClick={handleUnselectAllBankNifty}
-                      disabled={isRunning}
-                      className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200/80 cursor-pointer"
-                      title="Unselect all Bank Nifty symbols"
-                    >
-                      <XCircle className="w-3.5 h-3.5 text-rose-500" />
-                      <span>Unselect All</span>
-                    </button>
-                  </div>
-
-                  <span className="font-mono text-emerald-800 font-bold">{filteredBankNiftyList.length} items</span>
-                </div>
-
-                {/* Scrollable List */}
-                <div className="max-h-64 overflow-y-auto space-y-1.5 pr-1 text-xs">
-                  {filteredBankNiftyList.length === 0 ? (
-                    <div className="p-6 text-center text-sky-600 font-medium text-xs">
-                      No Bank Nifty symbols match "{bankNiftyQuery}"
-                    </div>
-                  ) : (
-                    filteredBankNiftyList.map((stock, idx) => {
-                      const isChecked = selectedBankNiftySymbols.includes(stock.symbol);
-                      return (
-                        <div
-                          key={`${stock.symbol}-${idx}`}
-                          onClick={() => toggleBankNiftySymbol(stock.symbol)}
-                          className={`flex items-center justify-between p-2 rounded-xl transition-all cursor-pointer select-none border ${
-                            isChecked
-                              ? 'bg-emerald-100/80 border-emerald-300/80 text-emerald-950 font-semibold shadow-xs'
-                              : 'bg-white/60 hover:bg-emerald-50/80 border-sky-100/60 text-slate-700'
-                          }`}
-                        >
-                          <div className="flex items-center gap-2.5 min-w-0">
-                            <input
-                              type="checkbox"
-                              checked={isChecked}
-                              onChange={() => {}}
-                              className="w-4 h-4 rounded border-emerald-300 text-emerald-600 focus:ring-emerald-400 cursor-pointer accent-emerald-600"
-                            />
-                            <span className="font-mono font-bold text-sky-950 text-xs w-36 shrink-0">
-                              {stock.ticker}
-                            </span>
-                            <span className="truncate text-sky-900 text-[11px]">
-                              {stock.name}
-                            </span>
-                          </div>
-
-                          {stock.sector && (
-                            <span className="text-[10px] font-medium text-emerald-800 bg-emerald-200/60 px-2 py-0.5 rounded-md shrink-0 ml-2">
-                              {stock.sector}
-                            </span>
-                          )}
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-
-                {/* Dropdown Footer */}
-                <div className="mt-3 pt-2.5 border-t border-emerald-100 flex items-center justify-between text-xs">
-                  <span className="font-semibold text-sky-950">
-                    {selectedBankNiftyCount} of {BANK_NIFTY_SYMBOLS.length} Bank Nifty Selected
-                  </span>
-                  <button
-                    onClick={() => setIsBankNiftyOpen(false)}
-                    className="bg-emerald-600 text-white hover:bg-emerald-700 px-4 py-1.5 rounded-xl font-bold text-xs cursor-pointer shadow-xs"
-                  >
-                    Done
-                  </button>
-                </div>
-
-              </div>
-            )}
-          </div>
-
-        </section>
-
-        {/* Live Market Snapshot Cards */}
-        {Object.keys(snapshots).length > 0 && (
-          <div className="space-y-2">
-            {selectedSymbols.length > 24 && (
-              <div className="flex items-center justify-between px-3.5 py-2 rounded-xl web2-card text-xs text-sky-900 font-medium">
-                <span>Displaying top 24 snapshot cards out of <strong>{selectedSymbols.length}</strong> active symbols.</span>
-                <span className="text-[11px] font-mono text-sky-700">All {selectedSymbols.length} symbols streaming live & recording to CSV Logger</span>
-              </div>
-            )}
-            <section className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 gap-4">
-              {selectedSymbols.slice(0, 24).map((sym, idx) => {
-                const snap = snapshots[sym];
-                if (!snap) return null;
-                const isPositive = snap.change >= 0;
-                const priceChanged = snap.prevLtp !== undefined && snap.ltp !== snap.prevLtp;
-                const isUp = snap.prevLtp !== undefined && snap.ltp > snap.prevLtp;
-
-                return (
-                  <div
-                    key={`${sym}-${idx}`}
-                    className={`web2-card p-4 rounded-2xl transition-all duration-300 ${
-                      priceChanged
-                        ? isUp
-                          ? 'ring-2 ring-emerald-400/80 bg-emerald-50/50'
-                          : 'ring-2 ring-rose-400/80 bg-rose-50/50'
-                        : ''
-                    }`}
-                  >
-                    <div className="flex items-center justify-between mb-1.5">
-                      <span className="font-mono font-bold text-sky-950 text-xs tracking-tight">
-                        {sym}
-                      </span>
-                      <span className="text-[10px] font-mono text-sky-700/80">
-                        {snap.date ? `${snap.date} ${snap.time || snap.lastUpdated}` : snap.lastUpdated}
-                      </span>
-                    </div>
-
-                    <div className="flex items-baseline justify-between mb-2">
-                      <div className="text-2xl font-black font-mono text-sky-950 tracking-tight">
-                        ₹{snap.ltp != null ? snap.ltp.toFixed(2) : '-'}
-                      </div>
-                      <div className={`flex items-center text-xs font-bold font-mono px-2 py-0.5 rounded-full ${
-                        isPositive 
-                          ? 'bg-emerald-100 text-emerald-800 border border-emerald-300' 
-                          : 'bg-rose-100 text-rose-800 border border-rose-300'
-                      }`}>
-                        {isPositive ? <ArrowUpRight className="w-3.5 h-3.5 mr-0.5" /> : <ArrowDownRight className="w-3.5 h-3.5 mr-0.5" />}
-                        <span>{isPositive ? '+' : ''}{snap.change != null ? snap.change.toFixed(2) : '-'}</span>
-                        <span className="ml-1 opacity-90">({isPositive ? '+' : ''}{snap.pChange != null ? snap.pChange.toFixed(2) : '-'}%)</span>
-                      </div>
-                    </div>
-
-                    {/* OHLC Bar */}
-                    <div className="grid grid-cols-4 gap-1 p-1.5 rounded-xl bg-sky-50/80 border border-sky-100 text-[10px] font-mono text-sky-950 text-center mb-2">
-                      <div>
-                        <span className="text-sky-500 font-sans block text-[9px]">OPEN</span>
-                        <span className="font-bold">{snap.open != null ? snap.open.toFixed(2) : '-'}</span>
-                      </div>
-                      <div>
-                        <span className="text-emerald-600 font-sans block text-[9px]">HIGH</span>
-                        <span className="font-bold">{snap.high != null ? snap.high.toFixed(2) : '-'}</span>
-                      </div>
-                      <div>
-                        <span className="text-rose-500 font-sans block text-[9px]">LOW</span>
-                        <span className="font-bold">{snap.low != null ? snap.low.toFixed(2) : '-'}</span>
-                      </div>
-                      <div>
-                        <span className="text-sky-600 font-sans block text-[9px]">CLOSE</span>
-                        <span className="font-bold">{snap.close != null ? snap.close.toFixed(2) : '-'}</span>
-                      </div>
-                    </div>
-
-                    <div className="pt-2 border-t border-sky-100 flex items-center justify-between text-[11px] text-sky-900 font-mono">
-                      <span>Qty: <strong className="text-sky-950">{snap.quantity || '-'}</strong></span>
-                      <span>Vol: <strong className="text-sky-950">{snap.volume != null ? snap.volume.toLocaleString() : '-'}</strong></span>
-                      <span>Avg: <strong className="text-sky-950">{snap.average != null ? snap.average.toFixed(2) : '-'}</strong></span>
-                    </div>
-                  </div>
-                );
-              })}
-            </section>
-          </div>
-        )}
-
-
-        {/* Terminal & Live CSV Logger Data Table Section */}
-        <section className="flex-1 flex flex-col web2-terminal rounded-2xl md:rounded-3xl overflow-hidden border border-sky-300/40 shadow-2xl bg-slate-950/90 text-slate-100">
-          
-          {/* Section Header with View Tabs */}
-          <div className="bg-slate-900/90 border-b border-slate-800 px-4 py-3 flex flex-wrap items-center justify-between gap-3 select-none">
-            <div className="flex items-center gap-3">
-              <div className="flex items-center gap-1.5 mr-1">
-                <span className="w-3 h-3 rounded-full bg-rose-500 inline-block shadow-sm"></span>
-                <span className="w-3 h-3 rounded-full bg-amber-400 inline-block shadow-sm"></span>
-                <span className="w-3 h-3 rounded-full bg-emerald-400 inline-block shadow-sm"></span>
-              </div>
-              
-              {/* Tab Switcher */}
-              <div className="flex items-center gap-1 bg-slate-950/80 p-1 rounded-xl border border-slate-800">
-                <button
-                  type="button"
-                  onClick={() => setActiveViewTab('terminal')}
-                  className={`px-3 py-1 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
-                    activeViewTab === 'terminal'
-                      ? 'bg-sky-600 text-white shadow-xs'
-                      : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
+              {/* Stop Button */}
+              <button
+                id="btn-stop"
+                onClick={handleStop}
+                disabled={!isRunning}
+                className={`flex-none flex items-center justify-center gap-1.5 px-4 sm:px-5 py-2 rounded-xl font-bold text-xs sm:text-sm transition-all ${!isRunning
+                  ? 'bg-slate-200 text-slate-400 cursor-not-allowed border border-slate-300'
+                  : 'glossy-btn-rose text-white cursor-pointer'
                   }`}
-                >
-                  <Terminal className="w-3.5 h-3.5" />
-                  <span>Terminal Console</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setActiveViewTab('csvTable')}
-                  className={`px-3 py-1 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${
-                    activeViewTab === 'csvTable'
-                      ? 'bg-emerald-600 text-white shadow-xs'
-                      : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
-                  }`}
-                >
-                  <FileSpreadsheet className="w-3.5 h-3.5" />
-                  <span>
-                    {granularity === 'live' ? 'Live Ticks Table' : granularity === '1s' ? '1-Sec Bars Table' : '1-Min Bars Table'} ({csvRecords.length})
-                  </span>
-                </button>
-              </div>
-            </div>
+              >
+                <Square className="w-4 h-4 fill-current drop-shadow-sm" />
+                <span>Stop</span>
+              </button>
 
-            <div className="flex items-center gap-3 text-xs">
-              {activeViewTab === 'terminal' ? (
-                <>
-                  <label className="flex items-center gap-1.5 text-slate-300 hover:text-white cursor-pointer text-[11px]">
-                    <input
-                      type="checkbox"
-                      checked={autoScroll}
-                      onChange={(e) => setAutoScroll(e.target.checked)}
-                      className="rounded border-slate-700 bg-slate-900 text-sky-400 focus:ring-0 focus:ring-offset-0 cursor-pointer"
-                    />
-                    <span>Auto-scroll</span>
-                  </label>
-                  <span className="text-slate-600">|</span>
-                  <span className="font-mono text-[11px] text-sky-300">
-                    {logs.length} log lines
-                  </span>
-                </>
-              ) : (
-                <div className="flex items-center gap-2">
-                  <div className="relative">
-                    <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
-                    <input
-                      type="text"
-                      value={csvSearch}
-                      onChange={(e) => setCsvSearch(e.target.value)}
-                      placeholder="Filter CSV rows..."
-                      className="pl-8 pr-3 py-1 rounded-lg bg-slate-900 border border-slate-700 text-xs font-mono text-slate-200 placeholder:text-slate-500 focus:outline-none focus:ring-1 focus:ring-emerald-400 w-44"
-                    />
-                  </div>
-                  <div className="relative">
+              {/* Download Dropdown Button */}
+              <div className="relative" ref={downloadMenuRef}>
+                <button
+                  id="btn-download-menu"
+                  onClick={() => setDownloadMenuOpen(!downloadMenuOpen)}
+                  className="flex items-center justify-center gap-1.5 px-4 py-2.5 rounded-xl font-bold text-xs transition-all glossy-btn-cyan text-white cursor-pointer hover:brightness-105"
+                  title="Download recorded prices as XLSX"
+                >
+                  {downloadSuccess ? (
+                    <>
+                      <Check className="w-4 h-4 text-white" />
+                      <span>Downloaded!</span>
+                    </>
+                  ) : (
+                    <>
+                      <Download className="w-4 h-4" />
+                      <span>Download</span>
+                      {(dbStats?.totalRows ?? 0) > 0 && (
+                        <span className="ml-0.5 px-1.5 py-0.2 rounded-full bg-white/30 text-white text-[10px] font-mono font-extrabold">
+                          {dbStats!.totalRows.toLocaleString()}
+                        </span>
+                      )}
+                      <ChevronDown className={`w-3.5 h-3.5 transition-transform ${downloadMenuOpen ? 'rotate-180' : ''}`} />
+                    </>
+                  )}
+                </button>
+
+                {/* Download Format Popover Menu */}
+                {downloadMenuOpen && (
+                  <div className="absolute left-0 mt-2 z-50 w-80 web2-card p-2.5 rounded-2xl shadow-2xl border border-sky-300/90 bg-white/98 backdrop-blur-2xl animate-in fade-in slide-in-from-top-2 duration-150">
+                    <div className="px-3 py-1.5 text-[10px] uppercase font-mono tracking-wider font-bold text-sky-800 border-b border-sky-100 mb-1 flex items-center justify-between">
+                      <span>Current Session Export</span>
+                      {dbStats && (
+                        <span className="text-[10px] font-mono text-sky-600 lowercase font-medium">
+                          {dbStats.totalRows.toLocaleString()} rows
+                        </span>
+                      )}
+                    </div>
+
+                    {/* Full DB export */}
                     <button
-                      onClick={() => setDownloadMenuOpen(!downloadMenuOpen)}
+                      onClick={() => handleDownloadFromDb()}
+                      className="w-full flex items-center gap-3 px-3 py-2 rounded-xl text-left hover:bg-emerald-50 text-emerald-950 transition-colors cursor-pointer group"
+                    >
+                      <div className="p-2 rounded-lg bg-emerald-100 text-emerald-700 group-hover:bg-emerald-600 group-hover:text-white transition-colors">
+                        <FileSpreadsheet className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <div className="font-bold text-xs">Active Session DB (.xlsx)</div>
+                        <div className="text-[10px] text-emerald-700 font-mono">
+                          {dbStats ? `${dbStats.totalRows.toLocaleString()} rows in SQLite` : 'All ticks from SQLite'}
+                        </div>
+                      </div>
+                    </button>
+
+                    {/* Session CSV */}
+                    <button
+                      onClick={handleDownloadCsv}
                       disabled={csvRecords.length === 0}
-                      className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                      className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-left transition-colors group ${csvRecords.length === 0 ? 'opacity-40 cursor-not-allowed' : 'hover:bg-sky-50 text-sky-950 cursor-pointer'
+                        }`}
                     >
-                      <Download className="w-3.5 h-3.5" />
-                      <span>Export Data</span>
-                      <ChevronDown className={`w-3 h-3 transition-transform ${downloadMenuOpen ? 'rotate-180' : ''}`} />
+                      <div className="p-2 rounded-lg bg-sky-100 text-sky-700 group-hover:bg-sky-600 group-hover:text-white transition-colors">
+                        <FileCode2 className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <div className="font-bold text-xs">Session CSV (.csv)</div>
+                        <div className="text-[10px] text-sky-700 font-mono">{csvRecords.length} rows recorded</div>
+                      </div>
                     </button>
 
-                    {downloadMenuOpen && (
-                      <div className="absolute right-0 mt-2 z-50 w-56 web2-card p-1.5 rounded-xl shadow-2xl border border-slate-700 bg-slate-900 text-slate-100 animate-in fade-in slide-in-from-top-2 duration-150">
+                    {/* Session Excel */}
+                    <button
+                      onClick={handleDownloadExcel}
+                      disabled={csvRecords.length === 0}
+                      className={`w-full flex items-center gap-3 px-3 py-2 rounded-xl text-left transition-colors group ${csvRecords.length === 0 ? 'opacity-40 cursor-not-allowed' : 'hover:bg-violet-50 text-violet-950 cursor-pointer'
+                        }`}
+                    >
+                      <div className="p-2 rounded-lg bg-violet-100 text-violet-700 group-hover:bg-violet-600 group-hover:text-white transition-colors">
+                        <FileSpreadsheet className="w-4 h-4" />
+                      </div>
+                      <div>
+                        <div className="font-bold text-xs">Session Excel (.xlsx)</div>
+                        <div className="text-[10px] text-violet-700 font-mono">{csvRecords.length} rows recorded</div>
+                      </div>
+                    </button>
+
+                    {/* Past Session Backups Section */}
+                    <div className="border-t border-sky-100 mt-2 pt-2">
+                      <div className="px-3 py-1 flex items-center justify-between text-[10px] uppercase font-mono tracking-wider font-bold text-amber-900 mb-1.5">
+                        <span className="flex items-center gap-1.5">
+                          <Archive className="w-3.5 h-3.5 text-amber-600" />
+                          <span>Past Session Backups</span>
+                        </span>
+                        <span className="px-1.5 py-0.2 rounded-full bg-amber-100 text-amber-800 text-[10px] font-mono font-bold">
+                          {backups.length}
+                        </span>
+                      </div>
+
+                      {backups.length === 0 ? (
+                        <div className="px-3 py-2 text-[11px] text-slate-400 italic">
+                          No past session backups yet. Previous data is automatically backed up when a new session starts.
+                        </div>
+                      ) : (
+                        <div className="max-h-52 overflow-y-auto space-y-1.5 p-1 font-sans">
+                          {backups.slice(0, 4).map((b) => (
+                            <div key={b.id} className="p-2 rounded-xl bg-amber-50/60 border border-amber-200/80 hover:bg-amber-100/50 transition-colors">
+                              <div className="flex items-center justify-between">
+                                <span className="text-[11px] font-bold text-slate-800 flex items-center gap-1">
+                                  <Clock className="w-3 h-3 text-amber-600" />
+                                  <span>{b.timestamp}</span>
+                                </span>
+                                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-amber-200/70 text-amber-900 font-extrabold">
+                                  {b.totalTicks.toLocaleString()} ticks
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-1.5 mt-1.5">
+                                {b.xlsxFile && (
+                                  <button
+                                    onClick={() => handleDownloadBackupFile(b.xlsxFile)}
+                                    className="px-2 py-0.5 rounded bg-emerald-100 hover:bg-emerald-200 text-emerald-800 text-[10px] font-bold flex items-center gap-1 cursor-pointer transition-colors"
+                                    title={`Download ${b.xlsxFile}`}
+                                  >
+                                    <FileSpreadsheet className="w-3 h-3 text-emerald-700" />
+                                    <span>XLSX</span>
+                                  </button>
+                                )}
+                                {b.dbFile && (
+                                  <button
+                                    onClick={() => handleDownloadBackupFile(b.dbFile)}
+                                    className="px-2 py-0.5 rounded bg-blue-100 hover:bg-blue-200 text-blue-800 text-[10px] font-bold flex items-center gap-1 cursor-pointer transition-colors"
+                                    title={`Download ${b.dbFile}`}
+                                  >
+                                    <Database className="w-3 h-3 text-blue-700" />
+                                    <span>DB</span>
+                                  </button>
+                                )}
+                                {b.csvFile && (
+                                  <button
+                                    onClick={() => handleDownloadBackupFile(b.csvFile)}
+                                    className="px-2 py-0.5 rounded bg-slate-200 hover:bg-slate-300 text-slate-800 text-[10px] font-bold flex items-center gap-1 cursor-pointer transition-colors"
+                                    title={`Download ${b.csvFile}`}
+                                  >
+                                    <FileCode2 className="w-3 h-3 text-slate-700" />
+                                    <span>CSV</span>
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          ))}
+
+                          {backups.length > 4 && (
+                            <button
+                              onClick={() => {
+                                setDownloadMenuOpen(false);
+                                setShowBackupsModal(true);
+                              }}
+                              className="w-full py-1.5 text-center text-xs font-bold text-amber-700 hover:text-amber-800 hover:underline cursor-pointer flex items-center justify-center gap-1"
+                            >
+                              <span>View all {backups.length} archived sessions →</span>
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Subtle Divider */}
+              <div className="h-7 w-px bg-sky-200/80 hidden xl:block mx-1"></div>
+
+              {/* Nifty 500 Dropdown & Controls */}
+              <div className="flex flex-wrap items-center gap-2 text-xs relative z-50" ref={dropdownRef}>
+                <span className="text-sky-950 font-bold flex items-center gap-1.5 mr-0.5">
+                  <Layers className="w-4 h-4 text-sky-600" />
+                  <span>Nifty 500:</span>
+                </span>
+
+                {/* Nifty 500 Toggle Button */}
+                <button
+                  type="button"
+                  id="btn-nifty500-dropdown"
+                  onClick={() => !isRunning && setIsDropdownOpen(!isDropdownOpen)}
+                  disabled={isRunning}
+                  className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition-all web2-badge shadow-sm hover:brightness-105 cursor-pointer ${isRunning ? 'opacity-70 cursor-not-allowed' : ''
+                    }`}
+                >
+                  <span className="text-sky-950">
+                    {selectedNifty500Count === NIFTY_500_SYMBOLS.length
+                      ? 'All Nifty 500 Selected'
+                      : selectedNifty500Count === 0
+                        ? 'Select Nifty 500'
+                        : `${selectedNifty500Count} / 500 Selected`}
+                  </span>
+                  <span className="px-1.5 py-0.5 rounded-full bg-sky-200/70 text-sky-950 text-[10px] font-mono">
+                    {selectedNifty500Count}
+                  </span>
+                  {isDropdownOpen ? (
+                    <ChevronUp className="w-3.5 h-3.5 text-sky-700" />
+                  ) : (
+                    <ChevronDown className="w-3.5 h-3.5 text-sky-700" />
+                  )}
+                </button>
+
+                {/* Expanded Nifty 500 Dropdown Modal */}
+                {isDropdownOpen && (
+                  <div
+                    className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/60 backdrop-blur-xs animate-in fade-in duration-150"
+                    onClick={(e) => {
+                      if (e.target === e.currentTarget) setIsDropdownOpen(false);
+                    }}
+                  >
+                    <div
+                      className="relative w-full sm:w-[560px] md:w-[640px] max-h-[85vh] flex flex-col web2-card p-5 sm:p-6 rounded-3xl shadow-2xl border border-sky-300/90 bg-white/98 backdrop-blur-2xl"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      {/* Modal Header */}
+                      <div className="flex items-center justify-between pb-3 mb-3 border-b border-sky-100">
+                        <div className="flex items-center gap-2.5">
+                          <div className="w-9 h-9 rounded-2xl bg-sky-100 border border-sky-200 flex items-center justify-center text-sky-600 shadow-xs">
+                            <Layers className="w-5 h-5" />
+                          </div>
+                          <div>
+                            <h3 className="font-bold text-sm text-sky-950 leading-tight">
+                              Select Nifty 500 Equities
+                            </h3>
+                            <p className="text-[11px] text-slate-500">
+                              Choose stocks across sectors to monitor live
+                            </p>
+                          </div>
+                        </div>
                         <button
-                          onClick={handleDownloadCsv}
-                          className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-left hover:bg-slate-800 text-slate-200 transition-colors text-xs font-medium cursor-pointer"
+                          type="button"
+                          onClick={() => setIsDropdownOpen(false)}
+                          className="p-1.5 rounded-xl text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer"
                         >
-                          <FileCode2 className="w-4 h-4 text-sky-400" />
-                          <span>Export as CSV (.csv)</span>
-                        </button>
-                        <button
-                          onClick={handleDownloadExcel}
-                          className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-left hover:bg-slate-800 text-slate-200 transition-colors text-xs font-medium cursor-pointer"
-                        >
-                          <FileSpreadsheet className="w-4 h-4 text-emerald-400" />
-                          <span>Export as Excel (.xlsx)</span>
+                          <X className="w-5 h-5" />
                         </button>
                       </div>
-                    )}
+
+                      {/* Search Bar & Clear Search */}
+                      <div className="flex items-center gap-2 mb-3">
+                        <div className="relative flex-1">
+                          <Search className="w-4 h-4 text-sky-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                          <input
+                            type="text"
+                            value={searchQuery}
+                            onChange={(e) => setSearchQuery(e.target.value)}
+                            placeholder="Search Nifty 500 (e.g., RELIANCE, TCS, Bank, Tata)..."
+                            className="w-full pl-9 pr-8 py-2 rounded-xl bg-sky-50/80 border border-sky-200 text-xs font-medium text-sky-950 placeholder:text-sky-400 focus:outline-none focus:ring-2 focus:ring-sky-400"
+                          />
+                          {searchQuery && (
+                            <button
+                              onClick={() => setSearchQuery('')}
+                              className="absolute right-2.5 top-1/2 -translate-y-1/2 text-sky-400 hover:text-sky-700 p-0.5"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                        </div>
+
+                        {/* Sector Filter Dropdown */}
+                        <select
+                          value={selectedSector}
+                          onChange={(e) => setSelectedSector(e.target.value)}
+                          className="px-2.5 py-2 rounded-xl bg-sky-50/80 border border-sky-200 text-xs font-semibold text-sky-900 focus:outline-none focus:ring-2 focus:ring-sky-400 cursor-pointer"
+                        >
+                          <option value="ALL">All Sectors</option>
+                          {availableSectors.map(sec => (
+                            <option key={sec} value={sec}>{sec}</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      {/* Quick Select All, Unselect All & Presets */}
+                      <div className="flex flex-wrap items-center justify-between gap-2 pb-2.5 mb-2 border-b border-sky-100 text-[11px]">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <button
+                            type="button"
+                            id="btn-select-all-nifty500"
+                            onClick={handleSelectAllNifty500}
+                            disabled={isRunning}
+                            className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold glossy-btn-cyan text-white shadow-xs cursor-pointer hover:opacity-95"
+                            title="Select all Nifty 500 symbols"
+                          >
+                            <CheckSquare className="w-3.5 h-3.5 text-white" />
+                            <span>Select All</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            id="btn-unselect-all-nifty500"
+                            onClick={handleUnselectAllNifty500}
+                            disabled={isRunning}
+                            className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200/80 cursor-pointer"
+                            title="Unselect all Nifty 500 symbols"
+                          >
+                            <XCircle className="w-3.5 h-3.5 text-rose-500" />
+                            <span>Unselect All</span>
+                          </button>
+
+                          <div className="h-4 w-px bg-sky-200 mx-0.5"></div>
+
+                          <span className="font-bold text-sky-900">Presets:</span>
+                          <button
+                            onClick={() => handleSelectPreset('TOP_5')}
+                            className="px-2 py-0.5 rounded-lg bg-emerald-100/80 hover:bg-emerald-200 text-emerald-950 font-bold border border-emerald-300/80 cursor-pointer"
+                          >
+                            Top 5
+                          </button>
+                          <button
+                            onClick={() => handleSelectPreset('TOP_10')}
+                            className="px-2 py-0.5 rounded-lg bg-emerald-100/80 hover:bg-emerald-200 text-emerald-950 font-bold border border-emerald-300/80 cursor-pointer"
+                          >
+                            Top 10
+                          </button>
+                          <button
+                            onClick={() => handleSelectPreset('TOP_20')}
+                            className="px-2 py-0.5 rounded-lg bg-emerald-100/80 hover:bg-emerald-200 text-emerald-950 font-bold border border-emerald-300/80 cursor-pointer"
+                          >
+                            Top 20
+                          </button>
+                          <button
+                            onClick={() => handleSelectPreset('NIFTY_50')}
+                            className="px-2 py-0.5 rounded-lg bg-sky-100 hover:bg-sky-200 text-sky-900 font-semibold cursor-pointer"
+                          >
+                            Nifty 50
+                          </button>
+                          <button
+                            onClick={() => handleSelectPreset('TOP_100')}
+                            className="px-2 py-0.5 rounded-lg bg-sky-100 hover:bg-sky-200 text-sky-900 font-semibold cursor-pointer"
+                          >
+                            Top 100
+                          </button>
+                          <button
+                            onClick={() => handleSelectPreset('BANKING')}
+                            className="px-2 py-0.5 rounded-lg bg-sky-100 hover:bg-sky-200 text-sky-900 font-semibold cursor-pointer"
+                          >
+                            Banking
+                          </button>
+                          <button
+                            onClick={() => handleSelectPreset('IT')}
+                            className="px-2 py-0.5 rounded-lg bg-sky-100 hover:bg-sky-200 text-sky-900 font-semibold cursor-pointer"
+                          >
+                            IT
+                          </button>
+                        </div>
+
+                        <span className="text-[11px] font-mono text-sky-700 font-semibold">
+                          {filteredStockList.length} matches
+                        </span>
+                      </div>
+
+                      {/* Scrollable Symbol List with Select Boxes */}
+                      <div className="max-h-64 overflow-y-auto space-y-1.5 pr-1 text-xs">
+                        {filteredStockList.length === 0 ? (
+                          <div className="p-6 text-center text-sky-600 font-medium text-xs">
+                            No symbols match "{searchQuery}"
+                          </div>
+                        ) : (
+                          filteredStockList.map((stock, idx) => {
+                            const isChecked = selectedNifty500Symbols.includes(stock.symbol);
+                            return (
+                              <div
+                                key={`${stock.symbol}-${idx}`}
+                                onClick={() => toggleNifty500Symbol(stock.symbol)}
+                                className={`flex items-center justify-between p-2 rounded-xl transition-all cursor-pointer select-none border ${isChecked
+                                  ? 'bg-sky-100/80 border-sky-300/80 text-sky-950 font-semibold shadow-xs'
+                                  : 'bg-white/60 hover:bg-sky-50/80 border-sky-100/60 text-slate-700'
+                                  }`}
+                              >
+                                <div className="flex items-center gap-2.5 min-w-0">
+                                  <input
+                                    type="checkbox"
+                                    checked={isChecked}
+                                    onChange={() => { }} // handled by parent div onClick
+                                    className="w-4 h-4 rounded border-sky-300 text-sky-600 focus:ring-sky-400 cursor-pointer accent-sky-600"
+                                  />
+                                  <span className="font-mono font-bold text-sky-950 text-xs w-28 shrink-0">
+                                    {stock.ticker}
+                                  </span>
+                                  <span className="truncate text-sky-900 text-[11px]">
+                                    {stock.name}
+                                  </span>
+                                </div>
+
+                                {stock.sector && (
+                                  <span className="text-[10px] font-medium text-sky-700 bg-sky-200/50 px-2 py-0.5 rounded-md shrink-0 ml-2">
+                                    {stock.sector}
+                                  </span>
+                                )}
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+
+                      {/* Dropdown Footer */}
+                      <div className="mt-4 pt-3 border-t border-sky-100 flex items-center justify-between text-xs">
+                        <span className="font-semibold text-sky-950">
+                          {selectedNifty500Count} of {NIFTY_500_SYMBOLS.length} Nifty 500 Selected
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setIsDropdownOpen(false)}
+                          className="glossy-btn-cyan text-white px-5 py-2 rounded-xl font-bold text-xs cursor-pointer shadow-xs transition-all"
+                        >
+                          Done
+                        </button>
+                      </div>
+
+                    </div>
                   </div>
-                </div>
-              )}
-            </div>
-          </div>
+                )}
+              </div>
 
-          {/* Tab 1: Terminal Body */}
-          {activeViewTab === 'terminal' ? (
-            <div
-              id="terminal-output"
-              ref={terminalContainerRef}
-              onScroll={handleScroll}
-              className="flex-1 p-4 sm:p-5 font-mono text-xs sm:text-[13px] leading-relaxed overflow-y-auto max-h-[600px] min-h-[400px] bg-slate-950/90 text-slate-100 space-y-1"
-              style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace' }}
-            >
-              {logs.map((log) => {
-                if (log.type === 'system') {
-                  return (
-                    <div key={log.id} className="text-sky-300 whitespace-pre-wrap py-1 font-medium">
-                      {log.rawText}
+              {/* Bank Nifty Dropdown & Separate Controls */}
+              <div className="flex flex-wrap items-center gap-2.5 text-xs relative z-50" ref={bankNiftyRef}>
+                <span className="text-sky-950 font-bold flex items-center gap-1.5 mr-0.5">
+                  <Landmark className="w-4 h-4 text-emerald-600" />
+                  <span>Bank Nifty:</span>
+                </span>
+
+                {/* Bank Nifty Toggle Button */}
+                <button
+                  type="button"
+                  id="btn-banknifty-dropdown"
+                  onClick={() => !isRunning && setIsBankNiftyOpen(!isBankNiftyOpen)}
+                  disabled={isRunning}
+                  className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition-all web2-badge shadow-sm hover:brightness-105 cursor-pointer ${isRunning ? 'opacity-70 cursor-not-allowed' : ''
+                    }`}
+                >
+                  <span className="text-sky-950">
+                    {selectedBankNiftyCount === BANK_NIFTY_SYMBOLS.length
+                      ? 'All Bank Nifty Selected'
+                      : selectedBankNiftyCount === 0
+                        ? 'Select Bank Nifty'
+                        : `${selectedBankNiftyCount} / ${BANK_NIFTY_SYMBOLS.length} Selected`}
+                  </span>
+                  <span className="px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-950 text-[10px] font-mono border border-emerald-300/80">
+                    {selectedBankNiftyCount}
+                  </span>
+                  {isBankNiftyOpen ? (
+                    <ChevronUp className="w-3.5 h-3.5 text-sky-700" />
+                  ) : (
+                    <ChevronDown className="w-3.5 h-3.5 text-sky-700" />
+                  )}
+                </button>
+
+                {/* Expanded Bank Nifty Dropdown Modal */}
+                {isBankNiftyOpen && (
+                  <div
+                    className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/60 backdrop-blur-xs animate-in fade-in duration-150"
+                    onClick={(e) => {
+                      if (e.target === e.currentTarget) setIsBankNiftyOpen(false);
+                    }}
+                  >
+                    <div
+                      className="relative w-full sm:w-[560px] md:w-[640px] max-h-[85vh] flex flex-col web2-card p-5 sm:p-6 rounded-3xl shadow-2xl border border-emerald-300/90 bg-white/98 backdrop-blur-2xl"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      {/* Modal Header */}
+                      <div className="flex items-center justify-between pb-3 mb-3 border-b border-emerald-100">
+                        <div className="flex items-center gap-2.5">
+                          <div className="w-9 h-9 rounded-2xl bg-emerald-100 border border-emerald-200 flex items-center justify-center text-emerald-700 shadow-xs">
+                            <Landmark className="w-5 h-5" />
+                          </div>
+                          <div>
+                            <h3 className="font-bold text-sm text-emerald-950 leading-tight">
+                              Select Bank Nifty Contracts
+                            </h3>
+                            <p className="text-[11px] text-slate-500">
+                              Core banking constituents and index contracts
+                            </p>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setIsBankNiftyOpen(false)}
+                          className="p-1.5 rounded-xl text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer"
+                        >
+                          <X className="w-5 h-5" />
+                        </button>
+                      </div>
+
+                      {/* Search Bar & Clear Search */}
+                      <div className="flex items-center gap-2 mb-3">
+                        <div className="relative flex-1">
+                          <Search className="w-4 h-4 text-emerald-600 absolute left-3 top-1/2 -translate-y-1/2" />
+                          <input
+                            type="text"
+                            value={bankNiftyQuery}
+                            onChange={(e) => setBankNiftyQuery(e.target.value)}
+                            placeholder="Search Bank Nifty (e.g. NIFTYBANK, HDFCBANK, FUT, 50000CE)..."
+                            className="w-full pl-9 pr-8 py-2 rounded-xl bg-emerald-50/60 border border-emerald-200 text-xs font-medium text-sky-950 placeholder:text-sky-400 focus:outline-none focus:ring-2 focus:ring-emerald-400"
+                          />
+                          {bankNiftyQuery && (
+                            <button
+                              onClick={() => setBankNiftyQuery('')}
+                              className="absolute right-2.5 top-1/2 -translate-y-1/2 text-sky-400 hover:text-sky-700 p-0.5"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                        </div>
+
+                        {/* Sector Filter Dropdown */}
+                        <select
+                          value={bankNiftySector}
+                          onChange={(e) => setBankNiftySector(e.target.value)}
+                          className="px-2.5 py-2 rounded-xl bg-emerald-50/60 border border-emerald-200 text-xs font-semibold text-emerald-950 focus:outline-none focus:ring-2 focus:ring-emerald-400 cursor-pointer"
+                        >
+                          <option value="ALL">All Categories</option>
+                          {availableBankNiftySectors.map(sec => (
+                            <option key={sec} value={sec}>{sec}</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      {/* Info & Dedicated Buttons Header */}
+                      <div className="flex items-center justify-between pb-2 mb-2 border-b border-emerald-100 text-[11px]">
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            id="btn-select-all-banknifty"
+                            onClick={handleSelectAllBankNifty}
+                            disabled={isRunning}
+                            className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs cursor-pointer"
+                            title="Select all Bank Nifty symbols"
+                          >
+                            <CheckSquare className="w-3.5 h-3.5 text-white" />
+                            <span>Select All</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            id="btn-unselect-all-banknifty"
+                            onClick={handleUnselectAllBankNifty}
+                            disabled={isRunning}
+                            className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200/80 cursor-pointer"
+                            title="Unselect all Bank Nifty symbols"
+                          >
+                            <XCircle className="w-3.5 h-3.5 text-rose-500" />
+                            <span>Unselect All</span>
+                          </button>
+                        </div>
+
+                        <span className="font-mono text-emerald-800 font-bold">{filteredBankNiftyList.length} items</span>
+                      </div>
+
+                      {/* Scrollable List */}
+                      <div className="max-h-64 overflow-y-auto space-y-1.5 pr-1 text-xs">
+                        {filteredBankNiftyList.length === 0 ? (
+                          <div className="p-6 text-center text-sky-600 font-medium text-xs">
+                            No Bank Nifty symbols match "{bankNiftyQuery}"
+                          </div>
+                        ) : (
+                          filteredBankNiftyList.map((stock, idx) => {
+                            const isChecked = selectedBankNiftySymbols.includes(stock.symbol);
+                            return (
+                              <div
+                                key={`${stock.symbol}-${idx}`}
+                                onClick={() => toggleBankNiftySymbol(stock.symbol)}
+                                className={`flex items-center justify-between p-2 rounded-xl transition-all cursor-pointer select-none border ${isChecked
+                                  ? 'bg-emerald-100/80 border-emerald-300/80 text-emerald-950 font-semibold shadow-xs'
+                                  : 'bg-white/60 hover:bg-emerald-50/80 border-sky-100/60 text-slate-700'
+                                  }`}
+                              >
+                                <div className="flex items-center gap-2.5 min-w-0">
+                                  <input
+                                    type="checkbox"
+                                    checked={isChecked}
+                                    onChange={() => { }}
+                                    className="w-4 h-4 rounded border-emerald-300 text-emerald-600 focus:ring-emerald-400 cursor-pointer accent-emerald-600"
+                                  />
+                                  <span className="font-mono font-bold text-sky-950 text-xs w-36 shrink-0">
+                                    {stock.ticker}
+                                  </span>
+                                  <span className="truncate text-sky-900 text-[11px]">
+                                    {stock.name}
+                                  </span>
+                                </div>
+
+                                {stock.sector && (
+                                  <span className="text-[10px] font-medium text-emerald-800 bg-emerald-200/60 px-2 py-0.5 rounded-md shrink-0 ml-2">
+                                    {stock.sector}
+                                  </span>
+                                )}
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+
+                      {/* Dropdown Footer */}
+                      <div className="mt-4 pt-3 border-t border-emerald-100 flex items-center justify-between text-xs">
+                        <span className="font-semibold text-sky-950">
+                          {selectedBankNiftyCount} of {BANK_NIFTY_SYMBOLS.length} Bank Nifty Selected
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setIsBankNiftyOpen(false)}
+                          className="bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2 rounded-xl font-bold text-xs cursor-pointer shadow-xs transition-all"
+                        >
+                          Done
+                        </button>
+                      </div>
+
                     </div>
-                  );
-                }
+                  </div>
+                )}
+              </div>
 
-                if (log.type === 'status') {
-                  const isSuccess = log.rawText.includes('successful') || log.rawText.includes('Connected') || log.rawText.includes('saved') || log.rawText.includes('recorded');
-                  const isWaiting = log.rawText.includes('Waiting') || log.rawText.includes('CSV logging active');
-                  return (
-                    <div key={log.id} className={`whitespace-pre-wrap ${
-                      isSuccess ? 'text-emerald-400 font-medium' :
-                      isWaiting ? 'text-cyan-300' : 'text-slate-300'
-                    }`}>
-                      {log.rawText}
+              {/* Nifty Futures Dropdown & Controls */}
+              <div className="flex flex-wrap items-center gap-2 text-xs relative z-50" ref={niftyFuturesRef}>
+                <span className="text-sky-950 font-bold flex items-center gap-1.5 mr-0.5">
+                  <TrendingUp className="w-4 h-4 text-purple-600" />
+                  <span>Futures:</span>
+                </span>
+
+                {/* Nifty Futures Toggle Button */}
+                <button
+                  type="button"
+                  id="btn-niftyfutures-dropdown"
+                  onClick={() => !isRunning && setIsNiftyFuturesOpen(!isNiftyFuturesOpen)}
+                  disabled={isRunning}
+                  className={`flex items-center gap-2 px-3.5 py-2 rounded-xl text-xs font-bold transition-all web2-badge shadow-sm hover:brightness-105 cursor-pointer border-purple-200/80 bg-purple-50/50 ${isRunning ? 'opacity-70 cursor-not-allowed' : ''
+                    }`}
+                >
+                  <span className="text-purple-950">
+                    {selectedNiftyFuturesCount === NIFTY_FUTURES_SYMBOLS.length
+                      ? 'All Futures Selected'
+                      : selectedNiftyFuturesCount === 0
+                        ? 'Select Futures'
+                        : `${selectedNiftyFuturesCount} / ${NIFTY_FUTURES_SYMBOLS.length} Selected`}
+                  </span>
+                  <span className="px-1.5 py-0.5 rounded-full bg-purple-200 text-purple-950 text-[10px] font-mono font-extrabold">
+                    {selectedNiftyFuturesCount}
+                  </span>
+                  {isNiftyFuturesOpen ? (
+                    <ChevronUp className="w-3.5 h-3.5 text-purple-700" />
+                  ) : (
+                    <ChevronDown className="w-3.5 h-3.5 text-purple-700" />
+                  )}
+                </button>
+
+                {/* Expanded Nifty Futures Dropdown Modal */}
+                {isNiftyFuturesOpen && (
+                  <div
+                    className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/60 backdrop-blur-xs animate-in fade-in duration-150"
+                    onClick={(e) => {
+                      if (e.target === e.currentTarget) setIsNiftyFuturesOpen(false);
+                    }}
+                  >
+                    <div
+                      className="relative w-full sm:w-[560px] md:w-[640px] max-h-[85vh] flex flex-col web2-card p-5 sm:p-6 rounded-3xl shadow-2xl border border-purple-300/90 bg-white/98 backdrop-blur-2xl"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      {/* Modal Header */}
+                      <div className="flex items-center justify-between pb-3 mb-3 border-b border-purple-100">
+                        <div className="flex items-center gap-2.5">
+                          <div className="w-9 h-9 rounded-2xl bg-purple-100 border border-purple-200 flex items-center justify-center text-purple-600 shadow-xs">
+                            <TrendingUp className="w-5 h-5" />
+                          </div>
+                          <div>
+                            <h3 className="font-bold text-sm text-purple-950 leading-tight">
+                              Select Nifty & Bank Nifty Futures
+                            </h3>
+                            <p className="text-[11px] text-slate-500">
+                              Real-time index and stock derivative contracts
+                            </p>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setIsNiftyFuturesOpen(false)}
+                          className="p-1.5 rounded-xl text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer"
+                        >
+                          <X className="w-5 h-5" />
+                        </button>
+                      </div>
+
+                      {/* Search Bar & Clear Search */}
+                      <div className="flex items-center gap-2 mb-3">
+                        <div className="relative flex-1">
+                          <Search className="w-4 h-4 text-purple-600 absolute left-3 top-1/2 -translate-y-1/2" />
+                          <input
+                            type="text"
+                            value={niftyFuturesQuery}
+                            onChange={(e) => setNiftyFuturesQuery(e.target.value)}
+                            placeholder="Search Futures (e.g. NIFTY, SEP, BANKNIFTY, RELIANCE)..."
+                            className="w-full pl-9 pr-8 py-2 rounded-xl bg-purple-50/60 border border-purple-200 text-xs font-medium text-sky-950 placeholder:text-purple-400 focus:outline-none focus:ring-2 focus:ring-purple-400"
+                          />
+                          {niftyFuturesQuery && (
+                            <button
+                              onClick={() => setNiftyFuturesQuery('')}
+                              className="absolute right-2.5 top-1/2 -translate-y-1/2 text-purple-400 hover:text-purple-700 p-0.5"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                        </div>
+
+                        {/* Category Filter Dropdown */}
+                        <select
+                          value={niftyFuturesSector}
+                          onChange={(e) => setNiftyFuturesSector(e.target.value)}
+                          className="px-2.5 py-2 rounded-xl bg-purple-50/60 border border-purple-200 text-xs font-semibold text-purple-950 focus:outline-none focus:ring-2 focus:ring-purple-400 cursor-pointer"
+                        >
+                          <option value="ALL">All Categories</option>
+                          {availableNiftyFuturesSectors.map(sec => (
+                            <option key={sec} value={sec}>{sec}</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      {/* Presets & Selection Header */}
+                      <div className="flex flex-wrap items-center justify-between gap-2 pb-2 mb-2 border-b border-purple-100 text-[11px]">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <button
+                            type="button"
+                            id="btn-select-all-niftyfutures"
+                            onClick={handleSelectAllNiftyFutures}
+                            disabled={isRunning}
+                            className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold bg-purple-600 hover:bg-purple-700 text-white shadow-xs cursor-pointer"
+                            title="Select all futures symbols"
+                          >
+                            <CheckSquare className="w-3.5 h-3.5 text-white" />
+                            <span>Select All</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            id="btn-unselect-all-niftyfutures"
+                            onClick={handleUnselectAllNiftyFutures}
+                            disabled={isRunning}
+                            className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-bold bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200/80 cursor-pointer"
+                            title="Unselect all futures symbols"
+                          >
+                            <XCircle className="w-3.5 h-3.5 text-rose-500" />
+                            <span>Unselect All</span>
+                          </button>
+
+                          <div className="h-4 w-px bg-purple-200 mx-0.5"></div>
+
+                          <button
+                            type="button"
+                            onClick={() => handleSelectFuturesPreset('INDEX')}
+                            className="px-2 py-0.5 rounded-lg bg-purple-100 hover:bg-purple-200 text-purple-950 font-bold border border-purple-300/80 cursor-pointer"
+                          >
+                            Index Futures
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleSelectFuturesPreset('STOCK')}
+                            className="px-2 py-0.5 rounded-lg bg-purple-100 hover:bg-purple-200 text-purple-950 font-bold border border-purple-300/80 cursor-pointer"
+                          >
+                            Stock Futures
+                          </button>
+                        </div>
+
+                        <span className="font-mono text-purple-800 font-bold">{filteredNiftyFuturesList.length} items</span>
+                      </div>
+
+                      {/* Scrollable List */}
+                      <div className="max-h-64 overflow-y-auto space-y-1.5 pr-1 text-xs">
+                        {filteredNiftyFuturesList.length === 0 ? (
+                          <div className="p-6 text-center text-purple-600 font-medium text-xs">
+                            No futures contracts match "{niftyFuturesQuery}"
+                          </div>
+                        ) : (
+                          filteredNiftyFuturesList.map((stock, idx) => {
+                            const isChecked = selectedNiftyFuturesSymbols.includes(stock.symbol);
+                            return (
+                              <div
+                                key={`${stock.symbol}-${idx}`}
+                                onClick={() => toggleNiftyFuturesSymbol(stock.symbol)}
+                                className={`flex items-center justify-between p-2 rounded-xl transition-all cursor-pointer select-none border ${isChecked
+                                  ? 'bg-purple-100/80 border-purple-300/80 text-purple-950 font-semibold shadow-xs'
+                                  : 'bg-white/60 hover:bg-purple-50/80 border-purple-100/60 text-slate-700'
+                                  }`}
+                              >
+                                <div className="flex items-center gap-2.5 min-w-0">
+                                  <input
+                                    type="checkbox"
+                                    checked={isChecked}
+                                    onChange={() => { }}
+                                    className="w-4 h-4 rounded border-purple-300 text-purple-600 focus:ring-purple-400 cursor-pointer accent-purple-600"
+                                  />
+                                  <span className="font-mono font-bold text-sky-950 text-xs w-44 shrink-0">
+                                    {stock.ticker}
+                                  </span>
+                                  <span className="truncate text-sky-900 text-[11px]">
+                                    {stock.name}
+                                  </span>
+                                </div>
+
+                                {stock.sector && (
+                                  <span className="text-[10px] font-medium text-purple-800 bg-purple-200/60 px-2 py-0.5 rounded-md shrink-0 ml-2">
+                                    {stock.sector}
+                                  </span>
+                                )}
+                              </div>
+                            );
+                          })
+                        )}
+                      </div>
+
+                      {/* Dropdown Footer */}
+                      <div className="mt-4 pt-3 border-t border-purple-100 flex items-center justify-between text-xs">
+                        <span className="font-semibold text-sky-950">
+                          {selectedNiftyFuturesCount} of {NIFTY_FUTURES_SYMBOLS.length} Futures Selected
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setIsNiftyFuturesOpen(false)}
+                          className="bg-purple-600 hover:bg-purple-700 text-white px-5 py-2 rounded-xl font-bold text-xs cursor-pointer shadow-xs transition-all"
+                        >
+                          Done
+                        </button>
+                      </div>
+
                     </div>
-                  );
-                }
+                  </div>
+                )}
+              </div>
+            </section>
 
-                if (log.type === 'error') {
-                  return (
-                    <div key={log.id} className="text-rose-400 font-semibold whitespace-pre-wrap">
-                      {log.rawText}
-                    </div>
-                  );
-                }
+            {/* Live Market Snapshot Cards */}
+            {Object.keys(snapshots).length > 0 && (
+              <div className="space-y-2">
+                {selectedSymbols.length > 24 && (
+                  <div className="flex items-center justify-between px-3.5 py-2 rounded-xl web2-card text-xs text-sky-900 font-medium">
+                    <span>Displaying top 24 snapshot cards out of <strong>{selectedSymbols.length}</strong> active symbols.</span>
+                    <span className="text-[11px] font-mono text-sky-700">All {selectedSymbols.length} symbols streaming live & recording to CSV Logger</span>
+                  </div>
+                )}
+                <section className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 2xl:grid-cols-6 gap-4">
+                  {selectedSymbols.slice(0, 24).map((sym, idx) => {
+                    const snap = snapshots[sym];
+                    if (!snap) return null;
+                    const isPositive = snap.change >= 0;
+                    const priceChanged = snap.prevLtp !== undefined && snap.ltp !== snap.prevLtp;
+                    const isUp = snap.prevLtp !== undefined && snap.ltp > snap.prevLtp;
 
-                // Render Live Tick with formatted styling - showing Date, Time, Symbol, Open, High, Low, Close, LTP, Qty, Vol, Avg, Bid/Ask
-                if (log.type === 'tick') {
-                  const isPositive = (log.change ?? 0) >= 0;
-                  return (
-                    <div key={log.id} className="flex flex-wrap items-baseline gap-x-2.5 py-0.5 hover:bg-slate-900/80 rounded px-1.5 -mx-1 transition-colors text-[12px]">
-                      <span className="text-slate-400 select-none font-medium">
-                        {log.date ? `${log.date} ${log.time || ''}` : log.timestamp}
-                      </span>
-                      <span className="text-slate-700 select-none">|</span>
-                      <span className="text-sky-300 font-bold min-w-[140px]">
-                        {log.symbol}
-                      </span>
-                      <span className="text-slate-700 select-none">|</span>
-                      <span className="text-slate-300">
-                        O:<span className="text-white font-medium">{log.open?.toFixed(2) ?? '-'}</span> H:<span className="text-emerald-300 font-medium">{log.high?.toFixed(2) ?? '-'}</span> L:<span className="text-rose-300 font-medium">{log.low?.toFixed(2) ?? '-'}</span> C:<span className="text-white font-medium">{log.close?.toFixed(2) ?? '-'}</span>
-                      </span>
-                      <span className="text-slate-700 select-none">|</span>
-                      <span className={`font-bold min-w-[100px] ${isPositive ? 'text-emerald-400' : 'text-rose-400'}`}>
-                        LTP: {log.ltp?.toFixed(2)}
-                      </span>
-                      <span className="text-slate-700 select-none">|</span>
-                      <span className="text-cyan-300">
-                        Qty: {log.quantity ?? '-'}
-                      </span>
-                      <span className="text-slate-700 select-none">|</span>
-                      <span className="text-amber-300/90">
-                        Vol: {log.volume?.toLocaleString() ?? '-'}
-                      </span>
-                      <span className="text-slate-700 select-none">|</span>
-                      <span className="text-emerald-300/90">
-                        Avg: {log.average?.toFixed(2) ?? '-'}
-                      </span>
-                      {log.bid != null && log.ask != null && (
-                        <>
-                          <span className="text-slate-700 select-none">|</span>
-                          <span className="text-slate-400">
-                            Bid: <span className="text-slate-200">{log.bid?.toFixed(2)}</span> / Ask: <span className="text-slate-200">{log.ask?.toFixed(2)}</span>
+                    return (
+                      <div
+                        key={`${sym}-${idx}`}
+                        className={`web2-card p-4 rounded-2xl transition-all duration-300 ${priceChanged
+                          ? isUp
+                            ? 'ring-2 ring-emerald-400/80 bg-emerald-50/50'
+                            : 'ring-2 ring-rose-400/80 bg-rose-50/50'
+                          : ''
+                          }`}
+                      >
+                        <div className="flex items-center justify-between mb-1.5">
+                          <span className="font-mono font-bold text-sky-950 text-xs tracking-tight">
+                            {sym}
                           </span>
-                        </>
-                      )}
-                    </div>
-                  );
-                }
+                          <span className="text-[10px] font-mono text-sky-700/80">
+                            {snap.date ? `${snap.date} ${snap.time || snap.lastUpdated}` : snap.lastUpdated}
+                          </span>
+                        </div>
 
-                return (
-                  <div key={log.id} className="text-slate-300 whitespace-pre-wrap">
-                    {log.rawText}
+                        <div className="flex items-baseline justify-between mb-2">
+                          <div className="text-2xl font-black font-mono text-sky-950 tracking-tight">
+                            ₹{snap.ltp != null ? snap.ltp.toFixed(2) : '-'}
+                          </div>
+                          <div className={`flex items-center text-xs font-bold font-mono px-2 py-0.5 rounded-full ${isPositive
+                            ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                            : 'bg-rose-100 text-rose-800 border border-rose-300'
+                            }`}>
+                            {isPositive ? <ArrowUpRight className="w-3.5 h-3.5 mr-0.5" /> : <ArrowDownRight className="w-3.5 h-3.5 mr-0.5" />}
+                            <span>{isPositive ? '+' : ''}{snap.change != null ? snap.change.toFixed(2) : '-'}</span>
+                            <span className="ml-1 opacity-90">({isPositive ? '+' : ''}{snap.pChange != null ? snap.pChange.toFixed(2) : '-'}%)</span>
+                          </div>
+                        </div>
+
+                        {/* OHLC Bar */}
+                        <div className="grid grid-cols-4 gap-1 p-1.5 rounded-xl bg-sky-50/80 border border-sky-100 text-[10px] font-mono text-sky-950 text-center mb-2">
+                          <div>
+                            <span className="text-sky-500 font-sans block text-[9px]">OPEN</span>
+                            <span className="font-bold">{snap.open != null ? snap.open.toFixed(2) : '-'}</span>
+                          </div>
+                          <div>
+                            <span className="text-emerald-600 font-sans block text-[9px]">HIGH</span>
+                            <span className="font-bold">{snap.high != null ? snap.high.toFixed(2) : '-'}</span>
+                          </div>
+                          <div>
+                            <span className="text-rose-500 font-sans block text-[9px]">LOW</span>
+                            <span className="font-bold">{snap.low != null ? snap.low.toFixed(2) : '-'}</span>
+                          </div>
+                          <div>
+                            <span className="text-sky-600 font-sans block text-[9px]">CLOSE</span>
+                            <span className="font-bold">{snap.close != null ? snap.close.toFixed(2) : '-'}</span>
+                          </div>
+                        </div>
+
+                        <div className="pt-2 border-t border-sky-100 flex items-center justify-between text-[11px] text-sky-900 font-mono">
+                          <span>Qty: <strong className="text-sky-950">{snap.quantity || '-'}</strong></span>
+                          <span>Vol: <strong className="text-sky-950">{snap.volume != null ? snap.volume.toLocaleString() : '-'}</strong></span>
+                          <span>Avg: <strong className="text-sky-950">{snap.average != null ? snap.average.toFixed(2) : '-'}</strong></span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </section>
+              </div>
+            )}
+
+
+            {/* Terminal & Live CSV Logger Data Table Section */}
+            <section className="flex-1 flex flex-col web2-terminal rounded-2xl md:rounded-3xl overflow-hidden border border-sky-300/40 shadow-2xl bg-slate-950/90 text-slate-100">
+
+              {/* Section Header with View Tabs */}
+              <div className="bg-slate-900/90 border-b border-slate-800 px-4 py-3 flex flex-wrap items-center justify-between gap-3 select-none">
+                <div className="flex items-center gap-3">
+                  <div className="flex items-center gap-1.5 mr-1">
+                    <span className="w-3 h-3 rounded-full bg-rose-500 inline-block shadow-sm"></span>
+                    <span className="w-3 h-3 rounded-full bg-amber-400 inline-block shadow-sm"></span>
+                    <span className="w-3 h-3 rounded-full bg-emerald-400 inline-block shadow-sm"></span>
                   </div>
-                );
-              })}
 
-              {/* Active blinking terminal prompt */}
-              {isRunning && (
-                <div className="flex items-center gap-2 text-emerald-400 font-mono pt-2">
-                  <span className="animate-pulse">❯</span>
-                  <span className="text-sky-300 text-xs">streaming live ticks & writing to CSV...</span>
-                  <span className="inline-block w-2 h-4 bg-emerald-400 animate-pulse" />
+                  {/* Tab Switcher */}
+                  <div className="flex items-center gap-1 bg-slate-950/80 p-1 rounded-xl border border-slate-800">
+                    <button
+                      type="button"
+                      onClick={() => setActiveViewTab('terminal')}
+                      className={`px-3 py-1 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${activeViewTab === 'terminal'
+                        ? 'bg-sky-600 text-white shadow-xs'
+                        : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
+                        }`}
+                    >
+                      <Terminal className="w-3.5 h-3.5" />
+                      <span>Terminal Console</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setActiveViewTab('csvTable')}
+                      className={`px-3 py-1 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 cursor-pointer ${activeViewTab === 'csvTable'
+                        ? 'bg-emerald-600 text-white shadow-xs'
+                        : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
+                        }`}
+                    >
+                      <FileSpreadsheet className="w-3.5 h-3.5" />
+                      <span>
+                        {granularity === 'live' ? 'Live Ticks Table' : granularity === '1s' ? '1-Sec Bars Table' : '1-Min Bars Table'} ({csvRecords.length})
+                      </span>
+                    </button>
+                  </div>
                 </div>
-              )}
 
-              <div ref={terminalEndRef} />
-            </div>
-          ) : (
-            /* Tab 2: Live CSV Logger Data Table (Full Screen Width Grid) */
-            <div className="flex-1 overflow-x-auto p-2 bg-slate-950/95 min-h-[400px] max-h-[600px]">
-              {csvRecords.length === 0 ? (
-                <div className="flex flex-col items-center justify-center p-12 text-center text-slate-400 space-y-2">
-                  <FileSpreadsheet className="w-10 h-10 text-slate-600 animate-pulse" />
-                  <p className="font-bold text-sm text-slate-300">No CSV records captured yet.</p>
-                  <p className="text-xs text-slate-500">Click <strong>[Run]</strong> to start streaming ticks and recording market data into CSV format in real-time.</p>
+                <div className="flex items-center gap-3 text-xs">
+                  {activeViewTab === 'terminal' ? (
+                    <>
+                      <label className="flex items-center gap-1.5 text-slate-300 hover:text-white cursor-pointer text-[11px]">
+                        <input
+                          type="checkbox"
+                          checked={autoScroll}
+                          onChange={(e) => setAutoScroll(e.target.checked)}
+                          className="rounded border-slate-700 bg-slate-900 text-sky-400 focus:ring-0 focus:ring-offset-0 cursor-pointer"
+                        />
+                        <span>Auto-scroll</span>
+                      </label>
+                      <span className="text-slate-600">|</span>
+                      <span className="font-mono text-[11px] text-sky-300">
+                        {logs.length} log lines
+                      </span>
+                      <span className="text-slate-600">|</span>
+                      <button
+                        type="button"
+                        id="btn-clear-terminal"
+                        onClick={handleClear}
+                        className="flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-rose-950/80 text-slate-300 hover:text-rose-200 border border-slate-700 hover:border-rose-500/50 transition-all text-[11px] font-semibold cursor-pointer"
+                        title="Clear terminal console output"
+                      >
+                        <Trash2 className="w-3.5 h-3.5 text-rose-400" />
+                        <span>Clear</span>
+                      </button>
+                    </>
+                  ) : (
+                    <div className="flex items-center gap-2">
+                      <div className="relative">
+                        <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                        <input
+                          type="text"
+                          value={csvSearch}
+                          onChange={(e) => setCsvSearch(e.target.value)}
+                          placeholder="Filter CSV rows..."
+                          className="pl-8 pr-3 py-1 rounded-lg bg-slate-900 border border-slate-700 text-xs font-mono text-slate-200 placeholder:text-slate-500 focus:outline-none focus:ring-1 focus:ring-emerald-400 w-44"
+                        />
+                      </div>
+                      <div className="relative">
+                        <button
+                          onClick={() => setDownloadMenuOpen(!downloadMenuOpen)}
+                          disabled={csvRecords.length === 0}
+                          className="px-2.5 py-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                          <span>Export Data</span>
+                          <ChevronDown className={`w-3 h-3 transition-transform ${downloadMenuOpen ? 'rotate-180' : ''}`} />
+                        </button>
+
+                        {downloadMenuOpen && (
+                          <div className="absolute right-0 mt-2 z-50 w-56 web2-card p-1.5 rounded-xl shadow-2xl border border-slate-700 bg-slate-900 text-slate-100 animate-in fade-in slide-in-from-top-2 duration-150">
+                            <button
+                              onClick={handleDownloadCsv}
+                              className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-left hover:bg-slate-800 text-slate-200 transition-colors text-xs font-medium cursor-pointer"
+                            >
+                              <FileCode2 className="w-4 h-4 text-sky-400" />
+                              <span>Export as CSV (.csv)</span>
+                            </button>
+                            <button
+                              onClick={handleDownloadExcel}
+                              className="w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-left hover:bg-slate-800 text-slate-200 transition-colors text-xs font-medium cursor-pointer"
+                            >
+                              <FileSpreadsheet className="w-4 h-4 text-emerald-400" />
+                              <span>Export as Excel (.xlsx)</span>
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Tab 1: Terminal Body */}
+              {activeViewTab === 'terminal' ? (
+                <div
+                  id="terminal-output"
+                  ref={terminalContainerRef}
+                  onScroll={handleScroll}
+                  className="flex-1 p-4 sm:p-5 font-mono text-xs sm:text-[13px] leading-relaxed overflow-y-auto max-h-[600px] min-h-[400px] bg-slate-950/90 text-slate-100 space-y-1"
+                  style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace' }}
+                >
+                  {logs.map((log) => {
+                    if (log.type === 'system') {
+                      return (
+                        <div key={log.id} className="text-sky-300 whitespace-pre-wrap py-1 font-medium">
+                          {log.rawText}
+                        </div>
+                      );
+                    }
+
+                    if (log.type === 'status') {
+                      const isSuccess = log.rawText.includes('successful') || log.rawText.includes('Connected') || log.rawText.includes('saved') || log.rawText.includes('recorded');
+                      const isWaiting = log.rawText.includes('Waiting') || log.rawText.includes('CSV logging active');
+                      return (
+                        <div key={log.id} className={`whitespace-pre-wrap ${isSuccess ? 'text-emerald-400 font-medium' :
+                          isWaiting ? 'text-cyan-300' : 'text-slate-300'
+                          }`}>
+                          {log.rawText}
+                        </div>
+                      );
+                    }
+
+                    if (log.type === 'error') {
+                      return (
+                        <div key={log.id} className="text-rose-400 font-semibold whitespace-pre-wrap">
+                          {log.rawText}
+                        </div>
+                      );
+                    }
+
+                    // Render Live Tick with formatted styling - showing Date, Time, Symbol, Open, High, Low, Close, LTP, Qty, Vol, Avg, Bid/Ask
+                    if (log.type === 'tick') {
+                      const isPositive = (log.change ?? 0) >= 0;
+                      return (
+                        <div key={log.id} className="flex flex-wrap items-baseline gap-x-2.5 py-0.5 hover:bg-slate-900/80 rounded px-1.5 -mx-1 transition-colors text-[12px]">
+                          <span className="text-slate-400 select-none font-medium">
+                            {log.date ? `${log.date} ${log.time || ''}` : log.timestamp}
+                          </span>
+                          <span className="text-slate-700 select-none">|</span>
+                          <span className="text-sky-300 font-bold min-w-[140px]">
+                            {log.symbol}
+                          </span>
+                          <span className="text-slate-700 select-none">|</span>
+                          <span className="text-slate-300">
+                            O:<span className="text-white font-medium">{log.open?.toFixed(2) ?? '-'}</span> H:<span className="text-emerald-300 font-medium">{log.high?.toFixed(2) ?? '-'}</span> L:<span className="text-rose-300 font-medium">{log.low?.toFixed(2) ?? '-'}</span> C:<span className="text-white font-medium">{log.close?.toFixed(2) ?? '-'}</span>
+                          </span>
+                          <span className="text-slate-700 select-none">|</span>
+                          <span className={`font-bold min-w-[100px] ${isPositive ? 'text-emerald-400' : 'text-rose-400'}`}>
+                            LTP: {log.ltp?.toFixed(2)}
+                          </span>
+                          <span className="text-slate-700 select-none">|</span>
+                          <span className="text-cyan-300">
+                            Qty: {log.quantity ?? '-'}
+                          </span>
+                          <span className="text-slate-700 select-none">|</span>
+                          <span className="text-amber-300/90">
+                            Vol: {log.volume?.toLocaleString() ?? '-'}
+                          </span>
+                          <span className="text-slate-700 select-none">|</span>
+                          <span className="text-emerald-300/90">
+                            Avg: {log.average?.toFixed(2) ?? '-'}
+                          </span>
+                          {log.bid != null && log.ask != null && (
+                            <>
+                              <span className="text-slate-700 select-none">|</span>
+                              <span className="text-slate-400">
+                                Bid: <span className="text-slate-200">{log.bid?.toFixed(2)}</span> / Ask: <span className="text-slate-200">{log.ask?.toFixed(2)}</span>
+                              </span>
+                            </>
+                          )}
+                        </div>
+                      );
+                    }
+
+                    return (
+                      <div key={log.id} className="text-slate-300 whitespace-pre-wrap">
+                        {log.rawText}
+                      </div>
+                    );
+                  })}
+
+                  {/* Active blinking terminal prompt */}
+                  {isRunning && (
+                    <div className="flex items-center gap-2 text-emerald-400 font-mono pt-2">
+                      <span className="animate-pulse">❯</span>
+                      <span className="text-sky-300 text-xs">streaming live ticks & writing to CSV...</span>
+                      <span className="inline-block w-2 h-4 bg-emerald-400 animate-pulse" />
+                    </div>
+                  )}
+
+                  <div ref={terminalEndRef} />
                 </div>
               ) : (
-                <div className="min-w-full inline-block align-middle">
-                  <table className="w-full text-left font-mono text-xs text-slate-200 border-collapse">
-                    <thead>
-                      {granularity === 'live' ? (
-                        <tr className="bg-slate-900/90 text-slate-400 font-bold border-b border-slate-800 text-[11px] uppercase tracking-wider sticky top-0 z-10">
-                          <th className="py-2.5 px-3">Date</th>
-                          <th className="py-2.5 px-3">Time</th>
-                          <th className="py-2.5 px-3 text-sky-400">Symbol</th>
-                          <th className="py-2.5 px-3 text-white">LTP</th>
-                          <th className="py-2.5 px-3 text-cyan-300">Trade Qty / Vol</th>
-                          <th className="py-2.5 px-3 text-amber-300">Trade Value (₹)</th>
-                          <th className="py-2.5 px-3 text-slate-400">Bid</th>
-                          <th className="py-2.5 px-3 text-slate-400">Ask</th>
-                          <th className="py-2.5 px-3 text-slate-300">Spread</th>
-                          <th className="py-2.5 px-3 text-right">Change</th>
-                          <th className="py-2.5 px-3 text-right">% Change</th>
-                        </tr>
-                      ) : (
-                        <tr className="bg-slate-900/90 text-slate-400 font-bold border-b border-slate-800 text-[11px] uppercase tracking-wider sticky top-0 z-10">
-                          <th className="py-2.5 px-3">Date</th>
-                          <th className="py-2.5 px-3">Time</th>
-                          <th className="py-2.5 px-3 text-sky-400">Symbol</th>
-                          <th className="py-2.5 px-3 text-slate-300">{granularity} Open</th>
-                          <th className="py-2.5 px-3 text-emerald-400">{granularity} High</th>
-                          <th className="py-2.5 px-3 text-rose-400">{granularity} Low</th>
-                          <th className="py-2.5 px-3 text-slate-300">{granularity} Close</th>
-                          <th className="py-2.5 px-3 text-white">LTP</th>
-                          <th className="py-2.5 px-3 text-cyan-300">Trades</th>
-                          <th className="py-2.5 px-3 text-amber-300">{granularity} Vol</th>
-                          <th className="py-2.5 px-3 text-slate-400">Bid</th>
-                          <th className="py-2.5 px-3 text-slate-400">Ask</th>
-                          <th className="py-2.5 px-3 text-right">Change</th>
-                          <th className="py-2.5 px-3 text-right">% Change</th>
-                        </tr>
-                      )}
-                    </thead>
-                    <tbody className="divide-y divide-slate-800/60 font-mono text-[12px]">
-                      {csvRecords
-                        .slice()
-                        .reverse()
-                        .filter(r => !csvSearch || (r.symbol && r.symbol.toLowerCase().includes(csvSearch.toLowerCase())) || (r.date && r.date.includes(csvSearch)) || (r.time && r.time.includes(csvSearch)))
-                        .map((rec, i) => {
-                          const isPos = (rec.change ?? 0) >= 0;
-                          return granularity === 'live' ? (
-                            <tr key={`csv-row-${i}`} className="hover:bg-slate-900/80 transition-colors">
-                              <td className="py-2 px-3 text-slate-400">{rec.date || '-'}</td>
-                              <td className="py-2 px-3 text-slate-300">{rec.time || '-'}</td>
-                              <td className="py-2 px-3 font-bold text-sky-300">{rec.symbol}</td>
-                              <td className={`py-2 px-3 font-extrabold ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
-                                {rec.ltp != null ? rec.ltp.toFixed(2) : '-'}
-                              </td>
-                              <td className="py-2 px-3 text-cyan-300 font-bold">{rec.quantity != null ? rec.quantity : '-'}</td>
-                              <td className="py-2 px-3 text-amber-300 font-bold">
-                                ₹{((rec.tradeValue ?? (rec.ltp * (rec.quantity ?? 0)))).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                              </td>
-                              <td className="py-2 px-3 text-slate-400">{rec.bid != null ? rec.bid.toFixed(2) : '-'}</td>
-                              <td className="py-2 px-3 text-slate-400">{rec.ask != null ? rec.ask.toFixed(2) : '-'}</td>
-                              <td className="py-2 px-3 text-slate-300">
-                                {rec.spread != null ? rec.spread.toFixed(2) : (rec.ask != null && rec.bid != null ? (rec.ask - rec.bid).toFixed(2) : '-')}
-                              </td>
-                              <td className={`py-2 px-3 text-right font-bold ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
-                                {isPos ? '+' : ''}{rec.change != null ? rec.change.toFixed(2) : '-'}
-                              </td>
-                              <td className={`py-2 px-3 text-right font-bold ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
-                                {isPos ? '+' : ''}{rec.pChange != null ? rec.pChange.toFixed(2) : '-'}%
-                              </td>
+                /* Tab 2: Live CSV Logger Data Table (Full Screen Width Grid) */
+                <div className="flex-1 overflow-x-auto p-2 bg-slate-950/95 min-h-[400px] max-h-[600px]">
+                  {csvRecords.length === 0 ? (
+                    <div className="flex flex-col items-center justify-center p-12 text-center text-slate-400 space-y-2">
+                      <FileSpreadsheet className="w-10 h-10 text-slate-600 animate-pulse" />
+                      <p className="font-bold text-sm text-slate-300">No CSV records captured yet.</p>
+                      <p className="text-xs text-slate-500">Click <strong>[Run]</strong> to start streaming ticks and recording market data into CSV format in real-time.</p>
+                    </div>
+                  ) : (
+                    <div className="min-w-full inline-block align-middle">
+                      <table className="w-full text-left font-mono text-xs text-slate-200 border-collapse">
+                        <thead>
+                          {granularity === 'live' ? (
+                            <tr className="bg-slate-900/90 text-slate-400 font-bold border-b border-slate-800 text-[11px] uppercase tracking-wider sticky top-0 z-10">
+                              <th className="py-2.5 px-3">Date</th>
+                              <th className="py-2.5 px-3">Time</th>
+                              <th className="py-2.5 px-3 text-sky-400">Symbol</th>
+                              <th className="py-2.5 px-3 text-white">LTP</th>
+                              <th className="py-2.5 px-3 text-cyan-300">Trade Qty / Vol</th>
+                              <th className="py-2.5 px-3 text-amber-300">Trade Value (₹)</th>
+                              <th className="py-2.5 px-3 text-slate-400">Bid</th>
+                              <th className="py-2.5 px-3 text-slate-400">Ask</th>
+                              <th className="py-2.5 px-3 text-slate-300">Spread</th>
+                              <th className="py-2.5 px-3 text-right">Change</th>
+                              <th className="py-2.5 px-3 text-right">% Change</th>
                             </tr>
                           ) : (
-                            <tr key={`csv-row-${i}`} className="hover:bg-slate-900/80 transition-colors">
-                              <td className="py-2 px-3 text-slate-400">{rec.date || '-'}</td>
-                              <td className="py-2 px-3 text-slate-300">{rec.time || '-'}</td>
-                              <td className="py-2 px-3 font-bold text-sky-300">{rec.symbol}</td>
-                              <td className="py-2 px-3 text-slate-300">{rec.open != null ? rec.open.toFixed(2) : '-'}</td>
-                              <td className="py-2 px-3 text-emerald-400 font-semibold">{rec.high != null ? rec.high.toFixed(2) : '-'}</td>
-                              <td className="py-2 px-3 text-rose-400 font-semibold">{rec.low != null ? rec.low.toFixed(2) : '-'}</td>
-                              <td className="py-2 px-3 text-slate-300">{rec.close != null ? rec.close.toFixed(2) : '-'}</td>
-                              <td className={`py-2 px-3 font-extrabold ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
-                                {rec.ltp != null ? rec.ltp.toFixed(2) : '-'}
-                              </td>
-                              <td className="py-2 px-3 text-cyan-300 font-bold">{rec.quantity != null ? rec.quantity : '-'}</td>
-                              <td className="py-2 px-3 text-amber-300 font-bold">{rec.volume != null ? rec.volume.toLocaleString() : '-'}</td>
-                              <td className="py-2 px-3 text-slate-400">{rec.bid != null ? rec.bid.toFixed(2) : '-'}</td>
-                              <td className="py-2 px-3 text-slate-400">{rec.ask != null ? rec.ask.toFixed(2) : '-'}</td>
-                              <td className={`py-2 px-3 text-right font-bold ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
-                                {isPos ? '+' : ''}{rec.change != null ? rec.change.toFixed(2) : '-'}
-                              </td>
-                              <td className={`py-2 px-3 text-right font-bold ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
-                                {isPos ? '+' : ''}{rec.pChange != null ? rec.pChange.toFixed(2) : '-'}%
-                              </td>
+                            <tr className="bg-slate-900/90 text-slate-400 font-bold border-b border-slate-800 text-[11px] uppercase tracking-wider sticky top-0 z-10">
+                              <th className="py-2.5 px-3">Date</th>
+                              <th className="py-2.5 px-3">Time</th>
+                              <th className="py-2.5 px-3 text-sky-400">Symbol</th>
+                              <th className="py-2.5 px-3 text-slate-300">{granularity} Open</th>
+                              <th className="py-2.5 px-3 text-emerald-400">{granularity} High</th>
+                              <th className="py-2.5 px-3 text-rose-400">{granularity} Low</th>
+                              <th className="py-2.5 px-3 text-slate-300">{granularity} Close</th>
+                              <th className="py-2.5 px-3 text-white">LTP</th>
+                              <th className="py-2.5 px-3 text-cyan-300">Trades</th>
+                              <th className="py-2.5 px-3 text-amber-300">{granularity} Vol</th>
+                              <th className="py-2.5 px-3 text-slate-400">Bid</th>
+                              <th className="py-2.5 px-3 text-slate-400">Ask</th>
+                              <th className="py-2.5 px-3 text-right">Change</th>
+                              <th className="py-2.5 px-3 text-right">% Change</th>
                             </tr>
-                          );
-                        })}
-                    </tbody>
-                  </table>
+                          )}
+                        </thead>
+                        <tbody className="divide-y divide-slate-800/60 font-mono text-[12px]">
+                          {csvRecords
+                            .slice()
+                            .reverse()
+                            .filter(r => !csvSearch || (r.symbol && r.symbol.toLowerCase().includes(csvSearch.toLowerCase())) || (r.date && r.date.includes(csvSearch)) || (r.time && r.time.includes(csvSearch)))
+                            .map((rec, i) => {
+                              const isPos = (rec.change ?? 0) >= 0;
+                              return granularity === 'live' ? (
+                                <tr key={`csv-row-${i}`} className="hover:bg-slate-900/80 transition-colors">
+                                  <td className="py-2 px-3 text-slate-400">{rec.date || '-'}</td>
+                                  <td className="py-2 px-3 text-slate-300">{rec.time || '-'}</td>
+                                  <td className="py-2 px-3 font-bold text-sky-300">{rec.symbol}</td>
+                                  <td className={`py-2 px-3 font-extrabold ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                    {rec.ltp != null ? rec.ltp.toFixed(2) : '-'}
+                                  </td>
+                                  <td className="py-2 px-3 text-cyan-300 font-bold">{rec.quantity != null ? rec.quantity : '-'}</td>
+                                  <td className="py-2 px-3 text-amber-300 font-bold">
+                                    ₹{((rec.tradeValue ?? (rec.ltp * (rec.quantity ?? 0)))).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                  </td>
+                                  <td className="py-2 px-3 text-slate-400">{rec.bid != null ? rec.bid.toFixed(2) : '-'}</td>
+                                  <td className="py-2 px-3 text-slate-400">{rec.ask != null ? rec.ask.toFixed(2) : '-'}</td>
+                                  <td className="py-2 px-3 text-slate-300">
+                                    {rec.spread != null ? rec.spread.toFixed(2) : (rec.ask != null && rec.bid != null ? (rec.ask - rec.bid).toFixed(2) : '-')}
+                                  </td>
+                                  <td className={`py-2 px-3 text-right font-bold ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                    {isPos ? '+' : ''}{rec.change != null ? rec.change.toFixed(2) : '-'}
+                                  </td>
+                                  <td className={`py-2 px-3 text-right font-bold ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                    {isPos ? '+' : ''}{rec.pChange != null ? rec.pChange.toFixed(2) : '-'}%
+                                  </td>
+                                </tr>
+                              ) : (
+                                <tr key={`csv-row-${i}`} className="hover:bg-slate-900/80 transition-colors">
+                                  <td className="py-2 px-3 text-slate-400">{rec.date || '-'}</td>
+                                  <td className="py-2 px-3 text-slate-300">{rec.time || '-'}</td>
+                                  <td className="py-2 px-3 font-bold text-sky-300">{rec.symbol}</td>
+                                  <td className="py-2 px-3 text-slate-300">{rec.open != null ? rec.open.toFixed(2) : '-'}</td>
+                                  <td className="py-2 px-3 text-emerald-400 font-semibold">{rec.high != null ? rec.high.toFixed(2) : '-'}</td>
+                                  <td className="py-2 px-3 text-rose-400 font-semibold">{rec.low != null ? rec.low.toFixed(2) : '-'}</td>
+                                  <td className="py-2 px-3 text-slate-300">{rec.close != null ? rec.close.toFixed(2) : '-'}</td>
+                                  <td className={`py-2 px-3 font-extrabold ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                    {rec.ltp != null ? rec.ltp.toFixed(2) : '-'}
+                                  </td>
+                                  <td className="py-2 px-3 text-cyan-300 font-bold">{rec.quantity != null ? rec.quantity : '-'}</td>
+                                  <td className="py-2 px-3 text-amber-300 font-bold">{rec.volume != null ? rec.volume.toLocaleString() : '-'}</td>
+                                  <td className="py-2 px-3 text-slate-400">{rec.bid != null ? rec.bid.toFixed(2) : '-'}</td>
+                                  <td className="py-2 px-3 text-slate-400">{rec.ask != null ? rec.ask.toFixed(2) : '-'}</td>
+                                  <td className={`py-2 px-3 text-right font-bold ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                    {isPos ? '+' : ''}{rec.change != null ? rec.change.toFixed(2) : '-'}
+                                  </td>
+                                  <td className={`py-2 px-3 text-right font-bold ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
+                                    {isPos ? '+' : ''}{rec.pChange != null ? rec.pChange.toFixed(2) : '-'}%
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
                 </div>
               )}
-            </div>
-          )}
-        </section>
+            </section>
+          </>
+        )}
+
+        {/* Tab 2: Stock Screener Component */}
+        {platformTab === 'screener' && (
+          <StockScreener
+            onAddToMonitor={handleAddFromScreener}
+            onSelectForTrade={handleSelectForTrade}
+            monitoredSymbols={selectedSymbols}
+          />
+        )}
+
+        {/* Tab 3: Trading Dashboard Component */}
+        {platformTab === 'trading' && (
+          <TradingDashboard
+            initialSymbol={tradeTargetSymbol}
+            initialPrice={tradeTargetPrice}
+            availableSymbols={selectedSymbols}
+          />
+        )}
+
+        {/* Tab 4: Live Server Logs Component */}
+        {platformTab === 'logs' && (
+          <ServerLogsViewer />
+        )}
 
       </main>
 
@@ -1822,7 +2439,7 @@ export default function App() {
       {isTokenModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/60 backdrop-blur-sm animate-in fade-in duration-200">
           <div className="relative w-full max-w-lg bg-white/95 rounded-3xl border border-sky-200 shadow-2xl p-6 sm:p-7 flex flex-col gap-5 text-slate-800">
-            
+
             {/* Header */}
             <div className="flex items-start justify-between gap-3">
               <div className="flex items-center gap-3">
@@ -1870,11 +2487,10 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setAuthTab('1click')}
-                className={`flex-1 py-1.5 rounded-lg transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
-                  authTab === '1click'
-                    ? 'bg-white text-sky-950 shadow-xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
+                className={`flex-1 py-1.5 rounded-lg transition-all flex items-center justify-center gap-1.5 cursor-pointer ${authTab === '1click'
+                  ? 'bg-white text-sky-950 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+                  }`}
               >
                 <Sparkles className="w-3.5 h-3.5 text-sky-600" />
                 <span>1-Click Auto OAuth</span>
@@ -1882,11 +2498,10 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setAuthTab('manual')}
-                className={`flex-1 py-1.5 rounded-lg transition-all flex items-center justify-center gap-1.5 cursor-pointer ${
-                  authTab === 'manual'
-                    ? 'bg-white text-sky-950 shadow-xs'
-                    : 'text-slate-600 hover:text-slate-900'
-                }`}
+                className={`flex-1 py-1.5 rounded-lg transition-all flex items-center justify-center gap-1.5 cursor-pointer ${authTab === 'manual'
+                  ? 'bg-white text-sky-950 shadow-xs'
+                  : 'text-slate-600 hover:text-slate-900'
+                  }`}
               >
                 <ExternalLink className="w-3.5 h-3.5 text-slate-600" />
                 <span>Manual Paste (127.0.0.1)</span>
@@ -2041,7 +2656,116 @@ export default function App() {
         </div>
       )}
 
+      {/* Past Sessions Archive & Backups Modal */}
+      {showBackupsModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/60 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="relative w-full max-w-2xl bg-white/95 rounded-3xl border border-sky-200 shadow-2xl p-6 sm:p-7 flex flex-col gap-4 text-slate-800 max-h-[85vh]">
+            {/* Modal Header */}
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-2xl bg-amber-100 border border-amber-200 flex items-center justify-center text-amber-600 shadow-inner">
+                  <Archive className="w-5 h-5" />
+                </div>
+                <div>
+                  <h2 className="text-lg font-bold text-slate-950 leading-tight flex items-center gap-2">
+                    <span>Past Session Backups</span>
+                    <span className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 text-xs font-mono font-bold">
+                      {backups.length} Archived
+                    </span>
+                  </h2>
+                  <p className="text-xs text-slate-500 font-medium">
+                    All prior live market sessions safely backed up before fresh session execution
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowBackupsModal(false)}
+                className="p-1.5 rounded-xl hover:bg-slate-100 text-slate-400 hover:text-slate-600 transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Backups List */}
+            <div className="flex-1 overflow-y-auto pr-1 space-y-2.5">
+              {backups.length === 0 ? (
+                <div className="p-8 text-center text-slate-400 italic bg-slate-50 rounded-2xl border border-slate-100">
+                  <Archive className="w-8 h-8 text-slate-300 mx-auto mb-2" />
+                  <p>No past session archives found yet.</p>
+                  <p className="text-xs text-slate-400 mt-1">Starting a fresh streaming session automatically creates timestamped backups.</p>
+                </div>
+              ) : (
+                backups.map((b, idx) => (
+                  <div key={b.id || idx} className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200/80 hover:bg-amber-50/40 transition-colors flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="font-bold text-sm text-slate-900 flex items-center gap-1.5">
+                          <Clock className="w-3.5 h-3.5 text-amber-600" />
+                          <span>{b.timestamp}</span>
+                        </span>
+                        <span className="px-2 py-0.5 rounded-md bg-amber-100 text-amber-900 text-xs font-mono font-extrabold">
+                          {b.totalTicks.toLocaleString()} ticks
+                        </span>
+                      </div>
+                      <div className="text-[11px] text-slate-500 font-mono mt-1">
+                        Tag: {b.id} {b.dbSizeBytes ? `· ${(b.dbSizeBytes / 1024).toFixed(1)} KB` : ''}
+                      </div>
+                    </div>
+
+                    {/* Download buttons */}
+                    <div className="flex items-center gap-2 shrink-0">
+                      {b.xlsxFile && (
+                        <button
+                          onClick={() => handleDownloadBackupFile(b.xlsxFile)}
+                          className="px-3 py-1.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-sm transition-colors"
+                          title={`Download ${b.xlsxFile}`}
+                        >
+                          <FileSpreadsheet className="w-3.5 h-3.5" />
+                          <span>Excel (.xlsx)</span>
+                        </button>
+                      )}
+                      {b.dbFile && (
+                        <button
+                          onClick={() => handleDownloadBackupFile(b.dbFile)}
+                          className="px-3 py-1.5 rounded-xl bg-sky-600 hover:bg-sky-700 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-sm transition-colors"
+                          title={`Download ${b.dbFile}`}
+                        >
+                          <Database className="w-3.5 h-3.5" />
+                          <span>SQLite (.db)</span>
+                        </button>
+                      )}
+                      {b.csvFile && (
+                        <button
+                          onClick={() => handleDownloadBackupFile(b.csvFile)}
+                          className="px-3 py-1.5 rounded-xl bg-slate-700 hover:bg-slate-800 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-sm transition-colors"
+                          title={`Download ${b.csvFile}`}
+                        >
+                          <FileCode2 className="w-3.5 h-3.5" />
+                          <span>CSV (.csv)</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            {/* Footer */}
+            <div className="pt-2 border-t border-slate-100 flex items-center justify-between">
+              <span className="text-xs text-slate-400">
+                Backups stored locally in <code className="font-mono text-slate-600 font-bold">/backups</code>
+              </span>
+              <button
+                onClick={() => setShowBackupsModal(false)}
+                className="px-4 py-2 rounded-xl bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold text-xs cursor-pointer transition-colors"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }
-
