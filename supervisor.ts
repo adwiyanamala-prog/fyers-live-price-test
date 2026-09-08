@@ -1,6 +1,7 @@
 import express from "express";
 import http from "http";
 import path from "path";
+import fs from "fs";
 import { spawn, ChildProcess } from "child_process";
 
 const SUPERVISOR_PORT = Number(process.env.PORT) || 3000;
@@ -92,8 +93,12 @@ function startWorker(): { success: boolean; pid?: number; message: string } {
 
   appendLog(`[SUPERVISOR] Starting backend server process on port ${WORKER_PORT}...`, "system");
 
+  const serverDistPath = path.join(process.cwd(), "dist", "server.cjs");
   const serverTsPath = path.join(process.cwd(), "server.ts");
   const tsxCli = path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
+
+  const isProduction = process.env.NODE_ENV === "production" || !fs.existsSync(serverTsPath);
+  const useCompiled = isProduction && fs.existsSync(serverDistPath);
 
   const workerEnv: NodeJS.ProcessEnv = {
     ...process.env,
@@ -102,7 +107,10 @@ function startWorker(): { success: boolean; pid?: number; message: string } {
   };
 
   try {
-    workerProcess = spawn(process.execPath, [tsxCli, serverTsPath], {
+    const spawnArgs = useCompiled ? [serverDistPath] : [tsxCli, serverTsPath];
+    appendLog(`[SUPERVISOR] Spawning backend using ${useCompiled ? "compiled dist/server.cjs" : "tsx server.ts"}...`, "system");
+
+    workerProcess = spawn(process.execPath, spawnArgs, {
       cwd: process.cwd(),
       env: workerEnv,
       stdio: ["pipe", "pipe", "pipe"],
@@ -295,7 +303,17 @@ app.all("/api/*", (req, res) => {
     }
   });
 
-  req.pipe(proxyReq);
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      proxyReq.destroy();
+    }
+  });
+
+  if (req.method === "GET" || req.method === "HEAD") {
+    proxyReq.end();
+  } else {
+    req.pipe(proxyReq);
+  }
 });
 
 async function initSupervisor() {

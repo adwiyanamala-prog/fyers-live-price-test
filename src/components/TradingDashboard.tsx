@@ -177,6 +177,44 @@ export const TradingDashboard: React.FC<TradingDashboardProps> = ({
     return () => clearInterval(interval);
   }, [isPaper]);
 
+  const [reconcileNotice, setReconcileNotice] = useState<string | null>(null);
+
+  const handleCancelOrder = async (orderId: string) => {
+    try {
+      setLoading(true);
+      const res = await fetch('/api/trading/order/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: orderId, isPaper }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to cancel order');
+      setFeedback({ type: 'success', message: `Order ${orderId} cancelled.` });
+      fetchTradingData();
+    } catch (err: any) {
+      setFeedback({ type: 'error', message: err.message || 'Failed to cancel order' });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleReconcile = async () => {
+    try {
+      setLoading(true);
+      const res = await fetch(`/api/trading/reconcile?isPaper=${isPaper}`);
+      if (res.ok) {
+        const data = await res.json();
+        setReconcileNotice(`Reconciled: ${data.pendingOrders} Pending | ${data.filledOrders} Filled`);
+        fetchTradingData();
+        setTimeout(() => setReconcileNotice(null), 4000);
+      }
+    } catch (err) {
+      console.error('Reconciliation error:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   // Summary Metrics
   const totalPnl = positions.reduce((acc, pos) => acc + (pos.pnl || 0), 0);
   const totalValue = positions.reduce((acc, pos) => acc + (pos.currentValue || 0), 0);
@@ -583,7 +621,7 @@ export const TradingDashboard: React.FC<TradingDashboardProps> = ({
         <div className="lg:col-span-7 flex flex-col gap-4">
           
           {/* Sub Navigation: Positions vs Order Book */}
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between gap-2">
             <div className="flex items-center rounded-2xl bg-white p-1 border border-sky-200 shadow-xs text-xs font-bold">
               <button
                 type="button"
@@ -611,15 +649,32 @@ export const TradingDashboard: React.FC<TradingDashboardProps> = ({
               </button>
             </div>
 
-            <button
-              type="button"
-              onClick={fetchTradingData}
-              disabled={loading}
-              className="p-2 rounded-xl bg-white text-slate-600 hover:text-sky-700 border border-sky-200 transition-colors shadow-xs cursor-pointer"
-              title="Refresh positions & orders"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin text-sky-600' : ''}`} />
-            </button>
+            <div className="flex items-center gap-1.5">
+              {reconcileNotice && (
+                <span className="text-[11px] font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1 rounded-xl border border-emerald-200 animate-in fade-in">
+                  {reconcileNotice}
+                </span>
+              )}
+              <button
+                type="button"
+                onClick={handleReconcile}
+                disabled={loading}
+                className="px-2.5 py-1.5 rounded-xl bg-white text-slate-700 hover:text-sky-700 border border-sky-200 text-xs font-bold transition-colors shadow-xs cursor-pointer flex items-center gap-1.5"
+                title="Reconcile order state with broker"
+              >
+                <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />
+                <span>Reconcile</span>
+              </button>
+              <button
+                type="button"
+                onClick={fetchTradingData}
+                disabled={loading}
+                className="p-2 rounded-xl bg-white text-slate-600 hover:text-sky-700 border border-sky-200 transition-colors shadow-xs cursor-pointer"
+                title="Refresh positions & orders"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin text-sky-600' : ''}`} />
+              </button>
+            </div>
           </div>
 
           {/* Tab 1: Positions Table */}
@@ -650,13 +705,12 @@ export const TradingDashboard: React.FC<TradingDashboardProps> = ({
                         const isPos = pos.pnl >= 0;
                         return (
                           <tr key={pos.symbol} className="hover:bg-slate-900/80 transition-colors">
-                            <td className="py-3 px-3.5">
-                              <div className="font-bold text-sky-300">{pos.symbol}</div>
-                              <div className="text-[10px] text-slate-500">{pos.product}</div>
+                            <td className="py-3 px-3.5 font-bold text-white">
+                              {pos.symbol}
                             </td>
                             <td className="py-3 px-3">
-                              <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-                                pos.side === 'BUY' ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' : 'bg-rose-950 text-rose-400 border border-rose-800'
+                              <span className={`px-2 py-0.5 rounded-md font-bold ${
+                                pos.side === 'BUY' ? 'bg-emerald-950 text-emerald-400' : 'bg-rose-950 text-rose-400'
                               }`}>
                                 {pos.side}
                               </span>
@@ -664,7 +718,7 @@ export const TradingDashboard: React.FC<TradingDashboardProps> = ({
                             <td className="py-3 px-3 text-right font-bold text-white">
                               {pos.qty}
                             </td>
-                            <td className="py-3 px-3 text-right text-slate-300">
+                            <td className="py-3 px-3 text-right font-bold text-slate-300">
                               ₹{pos.avg_price.toFixed(2)}
                             </td>
                             <td className="py-3 px-3 text-right font-bold text-sky-300">
@@ -709,12 +763,13 @@ export const TradingDashboard: React.FC<TradingDashboardProps> = ({
                       <th className="py-3 px-3 text-right">Qty</th>
                       <th className="py-3 px-3 text-right">Price</th>
                       <th className="py-3 px-3 text-center">Status</th>
+                      <th className="py-3 px-3 text-center">Action</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-800/60 font-mono text-[11px]">
                     {orders.length === 0 ? (
                       <tr>
-                        <td colSpan={8} className="py-12 text-center text-slate-500">
+                        <td colSpan={9} className="py-12 text-center text-slate-500">
                           No order history found in {isPaper ? 'Paper Trading' : 'FYERS Account'}.
                         </td>
                       </tr>
@@ -749,11 +804,25 @@ export const TradingDashboard: React.FC<TradingDashboardProps> = ({
                           <td className="py-2.5 px-3 text-center">
                             <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
                               ord.status === 'COMPLETE' ? 'bg-emerald-950 text-emerald-300 border border-emerald-800' :
-                              ord.status === 'PENDING' ? 'bg-amber-950 text-amber-300 border border-amber-800' :
+                              ord.status === 'PENDING' ? 'bg-amber-950 text-amber-300 border border-amber-800 animate-pulse' :
                               'bg-rose-950 text-rose-300 border border-rose-800'
                             }`}>
                               {ord.status}
                             </span>
+                          </td>
+                          <td className="py-2.5 px-3 text-center">
+                            {ord.status === 'PENDING' ? (
+                              <button
+                                type="button"
+                                onClick={() => handleCancelOrder(ord.id)}
+                                className="px-2 py-0.5 rounded text-[10px] font-bold bg-rose-900/80 hover:bg-rose-800 text-rose-200 border border-rose-700 cursor-pointer transition-colors shadow-xs"
+                                title="Cancel this pending order"
+                              >
+                                Cancel
+                              </button>
+                            ) : (
+                              <span className="text-slate-600 text-[10px]">—</span>
+                            )}
                           </td>
                         </tr>
                       ))

@@ -36,8 +36,13 @@ import {
   TrendingUp,
   Archive,
   Database,
-  History
+  History,
+  Volume2,
+  VolumeX,
+  Bell,
+  BellRing
 } from 'lucide-react';
+import { soundAlerts, sendDesktopNotification, requestDesktopNotificationPermission } from './utils/audioAlerts';
 import { LogEntry, SymbolSnapshot, CsvRecord } from './types';
 
 export interface BackupRecord {
@@ -58,6 +63,7 @@ import { NIFTY_FUTURES_SYMBOLS } from './data/niftyfutures';
 import { StockScreener } from './components/StockScreener';
 import { TradingDashboard } from './components/TradingDashboard';
 import { ServerLogsViewer } from './components/ServerLogsViewer';
+import { SmartMoneyRadar } from './components/SmartMoneyRadar';
 
 export type AppTheme = 'sky' | 'emerald';
 
@@ -95,8 +101,26 @@ export default function App() {
   const [downloadMenuOpen, setDownloadMenuOpen] = useState<boolean>(false);
   const [granularity, setGranularity] = useState<'live' | '1s' | '1m'>('live');
   const [dbStats, setDbStats] = useState<{ totalRows: number; symbols: string[]; firstDate: string; lastDate: string; dbSizeBytes: number } | null>(null);
+  const [sqliteStats, setSqliteStats] = useState<{
+    dbSizeBytes: number;
+    dbSizeMB: number;
+    totalTicks: number;
+    totalBars1s: number;
+    totalBars1m: number;
+    totalSmartMoney: number;
+    totalOrders: number;
+    oldestTickDate: string | null;
+    newestTickDate: string | null;
+    retentionPolicy: string;
+  } | null>(null);
+  const [optimizingDb, setOptimizingDb] = useState<boolean>(false);
+  const [optimizeSuccessMsg, setOptimizeSuccessMsg] = useState<string | null>(null);
   const [backups, setBackups] = useState<BackupRecord[]>([]);
   const [showBackupsModal, setShowBackupsModal] = useState<boolean>(false);
+  const [soundEnabled, setSoundEnabled] = useState<boolean>(() => soundAlerts.isEnabled());
+  const [notificationsGranted, setNotificationsGranted] = useState<boolean>(() =>
+    typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted'
+  );
 
   // Fyers Token Generator Modal States
   const [isTokenModalOpen, setIsTokenModalOpen] = useState<boolean>(false);
@@ -119,10 +143,12 @@ export default function App() {
   const [tokenSuccessMsg, setTokenSuccessMsg] = useState<string | null>(null);
   const [authTab, setAuthTab] = useState<'1click' | 'manual'>('1click');
 
-  // Primary Platform Navigation Tab: 'monitor' | 'screener' | 'trading' | 'logs'
-  const [platformTab, setPlatformTab] = useState<'monitor' | 'screener' | 'trading' | 'logs'>('monitor');
+  // Primary Platform Navigation Tab: 'monitor' | 'screener' | 'trading' | 'smart_money' | 'logs'
+  const [platformTab, setPlatformTab] = useState<'monitor' | 'screener' | 'trading' | 'smart_money' | 'logs'>('monitor');
   const [tradeTargetSymbol, setTradeTargetSymbol] = useState<string>('NSE:RELIANCE-EQ');
   const [tradeTargetPrice, setTradeTargetPrice] = useState<number>(1310);
+  const [globalSmartMoneyAlert, setGlobalSmartMoneyAlert] = useState<any | null>(null);
+  const [radarSelectedSymbol, setRadarSelectedSymbol] = useState<string>('NSE:HFCL-EQ');
 
   // Screener Interactivity Handlers
   const handleAddFromScreener = (newSymbol: string) => {
@@ -187,6 +213,27 @@ export default function App() {
     localStorage.setItem('fyers_app_theme', newTheme);
   };
 
+  interface TokenHealth {
+    hasToken: boolean;
+    valid: boolean;
+    expired: boolean;
+    expiringSoon: boolean;
+    expiresAt: string | null;
+    minutesRemaining: number | null;
+    message: string;
+  }
+
+  const [tokenHealth, setTokenHealth] = useState<TokenHealth | null>(null);
+
+  const fetchTokenHealth = async () => {
+    try {
+      const res = await fetch('/api/fyers/token-health');
+      if (res.ok) {
+        const data = await res.json();
+        setTokenHealth(data);
+      }
+    } catch {}
+  };
 
   // Fetch DB stats & auth config periodically
   const fetchAuthConfig = async () => {
@@ -203,6 +250,9 @@ export default function App() {
 
   useEffect(() => {
     fetchAuthConfig();
+    fetchTokenHealth();
+    const tokenInterval = setInterval(fetchTokenHealth, 60000);
+    return () => clearInterval(tokenInterval);
   }, []);
 
   // Listen for FYERS popup callback success message
@@ -229,6 +279,37 @@ export default function App() {
     } catch { }
   };
 
+  const fetchSqliteStats = async () => {
+    try {
+      const res = await fetch('/api/db/stats');
+      if (res.ok) setSqliteStats(await res.json());
+    } catch { }
+  };
+
+  const handleOptimizeDb = async (retentionDays: number = 7) => {
+    setOptimizingDb(true);
+    setOptimizeSuccessMsg(null);
+    try {
+      const res = await fetch('/api/db/optimize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ retentionDays, vacuum: true }),
+      });
+      if (res.ok) {
+        const result = await res.json();
+        setOptimizeSuccessMsg(result.message);
+        soundAlerts.playOrderSuccessChime();
+        await fetchSqliteStats();
+        await fetchDbStats();
+        setTimeout(() => setOptimizeSuccessMsg(null), 8000);
+      }
+    } catch (err: any) {
+      alert('Optimization failed: ' + (err.message || 'Unknown error'));
+    } finally {
+      setOptimizingDb(false);
+    }
+  };
+
   const fetchBackups = async () => {
     try {
       const res = await fetch('/api/backups');
@@ -250,9 +331,11 @@ export default function App() {
 
   useEffect(() => {
     fetchDbStats();
+    fetchSqliteStats();
     fetchBackups();
     const interval = setInterval(() => {
       fetchDbStats();
+      fetchSqliteStats();
       fetchBackups();
     }, 8000);
     return () => clearInterval(interval);
@@ -443,6 +526,74 @@ export default function App() {
       } catch (err) {
         console.error('Failed to parse log:', err);
       }
+    });
+
+    es.addEventListener('smart_money_alert', (e: MessageEvent) => {
+      try {
+        const alertData = JSON.parse(e.data);
+        setGlobalSmartMoneyAlert(alertData);
+        soundAlerts.playSmartMoneyChime();
+        sendDesktopNotification(`🚨 Institutional Footprint: ${alertData.ticker}`, {
+          body: `₹${alertData.ltp} | ${alertData.pattern_type.replace(/_/g, ' ')} (${alertData.volume_multiple}x Vol)\n${alertData.note}`,
+        });
+        setTimeout(() => setGlobalSmartMoneyAlert(null), 9000);
+      } catch (err) {
+        console.error('Failed to parse smart money alert:', err);
+      }
+    });
+
+    es.addEventListener('order_update', (e: MessageEvent) => {
+      try {
+        const ordData = JSON.parse(e.data);
+        if (ordData.type === 'TP_HIT') {
+          soundAlerts.playOrderSuccessChime();
+          sendDesktopNotification('🎯 Target Hit!', {
+            body: ordData.message || `${ordData.symbol} Target reached. Closed at profit.`,
+          });
+        } else if (ordData.type === 'SL_HIT') {
+          soundAlerts.playRsiPullbackChime();
+          sendDesktopNotification('🛑 Stop-Loss Executed', {
+            body: ordData.message || `${ordData.symbol} Stop-loss reached. Position closed.`,
+          });
+        } else if (ordData.type === 'ORDER_FILLED') {
+          soundAlerts.playOrderSuccessChime();
+          sendDesktopNotification('✅ Order Executed', {
+            body: ordData.message || `${ordData.symbol} Order filled @ ₹${ordData.price}`,
+          });
+        }
+
+        setLogs(prev => [
+          ...prev,
+          {
+            id: `ord-${Date.now()}-${Math.random()}`,
+            type: ordData.type === 'SL_HIT' ? 'error' : 'status',
+            rawText: `[ORDER SYSTEM] ${ordData.message || JSON.stringify(ordData)}`,
+            timestamp: new Date().toLocaleTimeString(),
+          }
+        ]);
+      } catch (err) {
+        console.error('Failed to parse order_update:', err);
+      }
+    });
+
+    es.addEventListener('token_expired', (e: MessageEvent) => {
+      try {
+        const data = JSON.parse(e.data);
+        soundAlerts.playRsiPullbackChime();
+        sendDesktopNotification('🚨 FYERS Token Expired', {
+          body: data.message || 'Please refresh your token to stream live data.',
+        });
+        fetchTokenHealth();
+        setLogs(prev => [
+          ...prev,
+          {
+            id: `token-exp-${Date.now()}`,
+            type: 'error',
+            rawText: `🚨 [AUTH EXPIRED] ${data.message}. Click "Token Expired" in top header to refresh.`,
+            timestamp: new Date().toLocaleTimeString(),
+          }
+        ]);
+      } catch {}
     });
 
     es.addEventListener('tick', (e: MessageEvent) => {
@@ -898,10 +1049,10 @@ export default function App() {
     <div className={canvasClass}>
 
       {/* Top Header with Brand, Center Platform Tabs, and Right Actions (Token Active & Theme) */}
-      <header className="border-b border-sky-200/80 bg-white/85 backdrop-blur-xl sticky top-0 z-30 px-3 sm:px-6 lg:px-8 py-2.5 flex flex-wrap items-center justify-between gap-3 shadow-xs shadow-sky-200/40">
+      <header className="border-b border-sky-200/80 bg-white/90 backdrop-blur-xl sticky top-0 z-30 px-3 sm:px-4 lg:px-6 py-2 flex items-center justify-between gap-2 lg:gap-4 flex-nowrap w-full shadow-xs shadow-sky-200/40">
         
         {/* Brand / Logo */}
-        <div className="flex items-center gap-2.5 sm:gap-3 shrink-0">
+        <div className="flex items-center gap-2 sm:gap-3 shrink-0">
           <div className={`w-9 h-9 rounded-full flex items-center justify-center text-white shadow-lg shrink-0 ${theme === 'emerald' ? 'glossy-orb-emerald shadow-emerald-500/40' : 'glossy-orb shadow-sky-400/40'
             }`}>
             <Terminal className="w-4.5 h-4.5 text-white drop-shadow-sm" />
@@ -918,40 +1069,32 @@ export default function App() {
           </div>
         </div>
 
-        {/* Center: Primary Platform Tabs with Distinct Colors */}
-        <div className="p-1 rounded-2xl bg-slate-100/90 border border-slate-200/90 shadow-inner flex items-center gap-1.5 flex-wrap justify-center order-3 xl:order-none w-full xl:w-auto">
-          {/* Tab 1: Live Monitor (Sky/Blue Theme) */}
+        {/* Center: Primary Platform Tabs with Fixed Dimensions and Unified Inactive Color */}
+        <div className="p-1 rounded-2xl bg-slate-100/90 border border-slate-200/90 shadow-inner flex items-center gap-1 sm:gap-1.5 flex-nowrap overflow-x-auto scrollbar-none shrink mx-auto">
+          {/* Tab 1: Live Monitor */}
           <button
             type="button"
             id="tab-live-monitor"
             onClick={() => setPlatformTab('monitor')}
-            className={`px-3 py-1.5 sm:px-3.5 sm:py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+            className={`px-3 py-1.5 sm:px-3.5 sm:py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap shrink-0 ${
               platformTab === 'monitor'
                 ? 'bg-gradient-to-r from-sky-600 to-blue-600 text-white shadow-md shadow-sky-500/30 ring-1 ring-sky-400'
-                : 'bg-sky-50/90 hover:bg-sky-100/90 text-sky-900 border border-sky-200/80 shadow-2xs'
+                : 'bg-white/90 hover:bg-white text-slate-700 hover:text-slate-950 border border-slate-200/90 shadow-2xs'
             }`}
           >
-            <Activity className="w-3.5 h-3.5" />
+            <Activity className="w-3.5 h-3.5 shrink-0" />
             <span>Live Monitor</span>
 
-            {/* Embedded Live Status Button / Pill */}
+            {/* Embedded Live Status Indicator (Fixed Width) */}
             <span
-              className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[9px] sm:text-[10px] font-mono font-bold tracking-tight transition-all shadow-xs ${
-                status === 'streaming'
-                  ? platformTab === 'monitor'
-                    ? 'bg-emerald-500 text-white shadow-xs'
-                    : 'bg-emerald-100 text-emerald-800 border border-emerald-300'
-                  : status === 'connecting' || status === 'connected'
-                  ? platformTab === 'monitor'
-                    ? 'bg-amber-400 text-sky-950'
-                    : 'bg-amber-100 text-amber-800 border border-amber-300'
-                  : status === 'stopped'
-                  ? platformTab === 'monitor'
-                    ? 'bg-rose-500 text-white'
-                    : 'bg-rose-100 text-rose-800 border border-rose-300'
-                  : platformTab === 'monitor'
-                  ? 'bg-sky-800/80 text-sky-100'
-                  : 'bg-sky-100 text-sky-800 border border-sky-200'
+              className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[9px] sm:text-[10px] font-mono font-bold tracking-tight transition-all shadow-xs ${
+                platformTab === 'monitor'
+                  ? status === 'streaming'
+                    ? 'bg-emerald-500 text-white'
+                    : 'bg-sky-900/60 text-sky-100 border border-sky-400/40'
+                  : status === 'streaming'
+                  ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                  : 'bg-slate-100 text-slate-600 border border-slate-200/80'
               }`}
             >
               <span className="relative flex h-1.5 w-1.5">
@@ -960,86 +1103,100 @@ export default function App() {
                 )}
                 <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-current"></span>
               </span>
-              <span className="uppercase">
-                {status === 'streaming'
-                  ? `Live (${tickCount.toLocaleString()})`
-                  : status === 'connecting'
-                  ? 'Connecting...'
-                  : status === 'connected'
-                  ? 'Connected'
-                  : status === 'stopped'
-                  ? 'Stopped'
-                  : 'Ready'}
-              </span>
+              <span className="uppercase">{status === 'streaming' ? 'LIVE' : status === 'connecting' ? 'SYNC' : 'READY'}</span>
             </span>
           </button>
 
-          {/* Tab 2: Stock Screener (Purple/Violet Theme) */}
+          {/* Tab 2: Stock Screener */}
           <button
             type="button"
             id="tab-stock-screener"
             onClick={() => setPlatformTab('screener')}
-            className={`px-3 py-1.5 sm:px-3.5 sm:py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+            className={`px-3 py-1.5 sm:px-3.5 sm:py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap shrink-0 ${
               platformTab === 'screener'
                 ? 'bg-gradient-to-r from-purple-600 to-indigo-600 text-white shadow-md shadow-purple-500/30 ring-1 ring-purple-400'
-                : 'bg-purple-50/90 hover:bg-purple-100/90 text-purple-900 border border-purple-200/80 shadow-2xs'
+                : 'bg-white/90 hover:bg-white text-slate-700 hover:text-slate-950 border border-slate-200/90 shadow-2xs'
             }`}
           >
-            <SlidersHorizontal className="w-3.5 h-3.5" />
+            <SlidersHorizontal className="w-3.5 h-3.5 shrink-0" />
             <span>Stock Screener</span>
             <span
-              className={`px-1.5 py-0.2 rounded-full text-[9px] sm:text-[10px] font-mono font-bold ${
+              className={`px-1.5 py-0.5 rounded-full text-[9px] sm:text-[10px] font-mono font-bold ${
                 platformTab === 'screener'
                   ? 'bg-purple-900/60 text-purple-100 border border-purple-400/40'
-                  : 'bg-purple-200/70 text-purple-950 border border-purple-300/80'
+                  : 'bg-slate-100 text-slate-600 border border-slate-200/80'
               }`}
             >
               NIFTY 500
             </span>
           </button>
 
-          {/* Tab 3: Trading Dashboard (Emerald/Teal Theme) */}
+          {/* Tab 3: Trading Dashboard */}
           <button
             type="button"
             id="tab-trading"
             onClick={() => setPlatformTab('trading')}
-            className={`px-3 py-1.5 sm:px-3.5 sm:py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+            className={`px-3 py-1.5 sm:px-3.5 sm:py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap shrink-0 ${
               platformTab === 'trading'
                 ? 'bg-gradient-to-r from-emerald-600 to-teal-600 text-white shadow-md shadow-emerald-500/30 ring-1 ring-emerald-400'
-                : 'bg-emerald-50/90 hover:bg-emerald-100/90 text-emerald-950 border border-emerald-200/80 shadow-2xs'
+                : 'bg-white/90 hover:bg-white text-slate-700 hover:text-slate-950 border border-slate-200/90 shadow-2xs'
             }`}
           >
-            <Zap className="w-3.5 h-3.5" />
+            <Zap className="w-3.5 h-3.5 shrink-0" />
             <span>Trading</span>
             <span
-              className={`px-1.5 py-0.2 rounded-full text-[9px] sm:text-[10px] font-mono font-bold ${
+              className={`px-1.5 py-0.5 rounded-full text-[9px] sm:text-[10px] font-mono font-bold ${
                 platformTab === 'trading'
                   ? 'bg-emerald-900/60 text-emerald-100 border border-emerald-400/40'
-                  : 'bg-emerald-200/70 text-emerald-950 border border-emerald-300/80'
+                  : 'bg-slate-100 text-slate-600 border border-slate-200/80'
               }`}
             >
               PAPER / LIVE
             </span>
           </button>
 
-          {/* Tab 4: Server Logs (Dark Charcoal / Slate & Amber Theme) */}
+          {/* Tab 4: Smart Money Trail */}
+          <button
+            type="button"
+            id="tab-smart-money"
+            onClick={() => setPlatformTab('smart_money')}
+            className={`px-3 py-1.5 sm:px-3.5 sm:py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap shrink-0 ${
+              platformTab === 'smart_money'
+                ? 'bg-gradient-to-r from-amber-500 via-amber-600 to-yellow-600 text-slate-950 font-bold shadow-md shadow-amber-500/30 ring-1 ring-amber-300'
+                : 'bg-white/90 hover:bg-white text-slate-700 hover:text-slate-950 border border-slate-200/90 shadow-2xs'
+            }`}
+          >
+            <Sparkles className="w-3.5 h-3.5 shrink-0 text-amber-500" />
+            <span>Smart Money</span>
+            <span
+              className={`px-1.5 py-0.5 rounded-full text-[9px] sm:text-[10px] font-mono font-bold ${
+                platformTab === 'smart_money'
+                  ? 'bg-slate-950 text-amber-300 border border-amber-400/50'
+                  : 'bg-slate-100 text-slate-600 border border-slate-200/80'
+              }`}
+            >
+              RADAR
+            </span>
+          </button>
+
+          {/* Tab 5: Server Logs */}
           <button
             type="button"
             id="tab-server-logs"
             onClick={() => setPlatformTab('logs')}
-            className={`px-3 py-1.5 sm:px-3.5 sm:py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+            className={`px-3 py-1.5 sm:px-3.5 sm:py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap shrink-0 ${
               platformTab === 'logs'
                 ? 'bg-gradient-to-r from-slate-800 to-slate-950 text-amber-300 shadow-md shadow-slate-900/35 ring-1 ring-amber-500/50'
-                : 'bg-slate-50 hover:bg-slate-200/90 text-slate-800 border border-slate-300/80 shadow-2xs'
+                : 'bg-white/90 hover:bg-white text-slate-700 hover:text-slate-950 border border-slate-200/90 shadow-2xs'
             }`}
           >
-            <Terminal className="w-3.5 h-3.5" />
+            <Terminal className="w-3.5 h-3.5 shrink-0" />
             <span>Logs</span>
             <span
-              className={`px-1.5 py-0.2 rounded-full text-[9px] sm:text-[10px] font-mono font-bold ${
+              className={`px-1.5 py-0.5 rounded-full text-[9px] sm:text-[10px] font-mono font-bold ${
                 platformTab === 'logs'
                   ? 'bg-amber-400/20 text-amber-300 border border-amber-500/40'
-                  : 'bg-slate-200 text-slate-700 border border-slate-300'
+                  : 'bg-slate-100 text-slate-600 border border-slate-200/80'
               }`}
             >
               SERVER
@@ -1047,24 +1204,78 @@ export default function App() {
           </button>
         </div>
 
-        {/* Header Right: Token Active Button & Theme Toggle */}
-        <div className="flex items-center gap-2 sm:gap-2.5 shrink-0">
+        {/* Header Right: Audio Chimes, Push Notifications, Token Active Button & Theme Toggle */}
+        <div className="flex items-center gap-2 sm:gap-2.5 shrink-0 ml-auto xl:ml-0">
+          {/* Audio Chimes Toggle */}
+          <button
+            type="button"
+            id="btn-toggle-sound"
+            onClick={() => {
+              const next = soundAlerts.toggle();
+              setSoundEnabled(next);
+            }}
+            className={`p-2 rounded-xl border transition-all cursor-pointer flex items-center justify-center shrink-0 ${
+              soundEnabled
+                ? 'bg-amber-50 border-amber-300/80 text-amber-800 hover:bg-amber-100 shadow-2xs'
+                : 'bg-slate-100 border-slate-300 text-slate-400 hover:text-slate-600'
+            }`}
+            title={soundEnabled ? 'Synthesized Audio Chimes: Enabled (Click to Mute)' : 'Audio Muted (Click to Unmute)'}
+          >
+            {soundEnabled ? <Volume2 className="w-3.5 h-3.5 text-amber-600" /> : <VolumeX className="w-3.5 h-3.5 text-slate-400" />}
+          </button>
+
+          {/* Desktop Push Notification Permission */}
+          <button
+            type="button"
+            id="btn-toggle-notifications"
+            onClick={async () => {
+              const ok = await requestDesktopNotificationPermission();
+              setNotificationsGranted(ok);
+              if (ok) {
+                sendDesktopNotification('AdwiKetan Trading Desk Alerts', {
+                  body: 'Desktop notifications active for institutional footprints & high-win swing setups.',
+                });
+                soundAlerts.playOrderSuccessChime();
+              }
+            }}
+            className={`p-2 rounded-xl border transition-all cursor-pointer flex items-center justify-center shrink-0 ${
+              notificationsGranted
+                ? 'bg-sky-50 border-sky-300/80 text-sky-800 hover:bg-sky-100 shadow-2xs'
+                : 'bg-slate-100 border-slate-300 text-slate-400 hover:text-slate-600'
+            }`}
+            title={notificationsGranted ? 'Desktop Push Notifications: Active' : 'Click to Enable Desktop Push Notifications'}
+          >
+            {notificationsGranted ? <BellRing className="w-3.5 h-3.5 text-sky-600" /> : <Bell className="w-3.5 h-3.5 text-slate-400" />}
+          </button>
+
           {/* Fyers Auth / Token Button */}
           <button
             id="btn-fyers-auth"
             onClick={() => {
               fetchAuthConfig();
+              fetchTokenHealth();
               setIsTokenModalOpen(true);
             }}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-mono font-bold transition-all cursor-pointer shadow-xs ${authConfig?.hasToken
-              ? 'bg-emerald-50 text-emerald-800 border border-emerald-300 hover:bg-emerald-100 hover:border-emerald-400'
-              : 'bg-amber-50 text-amber-900 border border-amber-300 hover:bg-amber-100 animate-pulse'
-              }`}
-            title="Generate or update daily FYERS access token"
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-mono font-bold transition-all cursor-pointer shadow-xs ${
+              tokenHealth?.expired
+                ? 'bg-rose-50 text-rose-800 border border-rose-400 hover:bg-rose-100 animate-pulse'
+                : tokenHealth?.expiringSoon
+                ? 'bg-amber-50 text-amber-900 border border-amber-400 hover:bg-amber-100 animate-pulse'
+                : authConfig?.hasToken
+                ? 'bg-emerald-50 text-emerald-800 border border-emerald-300 hover:bg-emerald-100 hover:border-emerald-400'
+                : 'bg-amber-50 text-amber-900 border border-amber-300 hover:bg-amber-100 animate-pulse'
+            }`}
+            title={tokenHealth?.message || 'Generate or update daily FYERS access token'}
           >
-            <Key className="w-3.5 h-3.5 text-current" />
+            <Key className={`w-3.5 h-3.5 ${tokenHealth?.expired ? 'text-rose-600' : 'text-current'}`} />
             <span className="text-[11px]">
-              {authConfig?.hasToken ? 'Token Active' : 'Generate Token'}
+              {tokenHealth?.expired
+                ? 'Token Expired'
+                : tokenHealth?.expiringSoon
+                ? `Expires in ${tokenHealth.minutesRemaining}m`
+                : authConfig?.hasToken
+                ? 'Token Active'
+                : 'Generate Token'}
             </span>
           </button>
 
@@ -1309,17 +1520,35 @@ export default function App() {
                             </div>
                           ))}
 
-                          {backups.length > 4 && (
+                          <div className="pt-2 border-t border-slate-100 mt-1 flex flex-col gap-1.5">
+                            {backups.length > 3 && (
+                              <button
+                                onClick={() => {
+                                  setDownloadMenuOpen(false);
+                                  setShowBackupsModal(true);
+                                }}
+                                className="w-full py-1 text-center text-xs font-bold text-amber-700 hover:text-amber-800 hover:underline cursor-pointer flex items-center justify-center gap-1"
+                              >
+                                <span>View all {backups.length} archived sessions →</span>
+                              </button>
+                            )}
                             <button
                               onClick={() => {
                                 setDownloadMenuOpen(false);
+                                fetchSqliteStats();
                                 setShowBackupsModal(true);
                               }}
-                              className="w-full py-1.5 text-center text-xs font-bold text-amber-700 hover:text-amber-800 hover:underline cursor-pointer flex items-center justify-center gap-1"
+                              className="w-full py-1.5 px-2.5 rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-bold flex items-center justify-between cursor-pointer transition-colors shadow-2xs"
                             >
-                              <span>View all {backups.length} archived sessions →</span>
+                              <div className="flex items-center gap-1.5">
+                                <Database className="w-3.5 h-3.5 text-indigo-600" />
+                                <span>Database Health & Auto-Pruner</span>
+                              </div>
+                              <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-indigo-200/70 text-indigo-900 font-bold">
+                                {sqliteStats ? `${sqliteStats.dbSizeMB} MB` : 'Manage'}
+                              </span>
                             </button>
-                          )}
+                          </div>
                         </div>
                       )}
                     </div>
@@ -2403,6 +2632,10 @@ export default function App() {
           <StockScreener
             onAddToMonitor={handleAddFromScreener}
             onSelectForTrade={handleSelectForTrade}
+            onOpenSmartMoney={(sym) => {
+              if (sym) setRadarSelectedSymbol(sym);
+              setPlatformTab('smart_money');
+            }}
             monitoredSymbols={selectedSymbols}
           />
         )}
@@ -2416,23 +2649,180 @@ export default function App() {
           />
         )}
 
-        {/* Tab 4: Live Server Logs Component */}
+        {/* Tab 4: Smart Money Trail Component */}
+        {platformTab === 'smart_money' && (
+          <SmartMoneyRadar
+            onAddToMonitor={handleAddFromScreener}
+            onSelectForTrade={handleSelectForTrade}
+            monitoredSymbols={selectedSymbols}
+            initialSymbol={radarSelectedSymbol}
+          />
+        )}
+
+        {/* Tab 5: Live Server Logs Component */}
         {platformTab === 'logs' && (
           <ServerLogsViewer />
         )}
 
       </main>
 
-      {/* Full-width Footer */}
-      <footer className="border-t border-sky-200/60 px-4 sm:px-6 lg:px-8 py-3.5 text-center text-xs text-sky-900 bg-white/60 backdrop-blur-md flex flex-wrap items-center justify-between gap-2 w-full">
-        <div className="flex items-center gap-2">
-          <span className="font-semibold">FYERS API V3 Market Data WebSocket Spec</span>
-          <span className="text-sky-300">•</span>
-          <span className="text-sky-800">data_ws.FyersDataSocket</span>
-        </div>
-        <div className="font-mono text-[11px] text-sky-800 font-medium">
-          CSV Logger: Date, Time, Symbol, Open, High, Low, Close, LTP, Quantity, Volume, Average, Bid, Ask
-        </div>
+      {/* Dynamic App Status Footer (Reflecting Current Tab & System State) */}
+      <footer className="border-t border-sky-200/60 px-4 sm:px-6 lg:px-8 py-3 text-xs bg-white/80 backdrop-blur-md flex flex-wrap items-center justify-between gap-3 w-full transition-all duration-200 shadow-2xs">
+        {/* Tab 1: Live Monitor */}
+        {platformTab === 'monitor' && (
+          <>
+            <div className="flex items-center gap-2.5 flex-wrap">
+              <span className={`flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-mono font-bold uppercase tracking-wider ${
+                status === 'streaming'
+                  ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                  : status === 'connecting'
+                  ? 'bg-amber-100 text-amber-800 border border-amber-300'
+                  : 'bg-slate-100 text-slate-700 border border-slate-300'
+              }`}>
+                <span className={`w-1.5 h-1.5 rounded-full ${status === 'streaming' ? 'bg-emerald-500 animate-pulse' : status === 'connecting' ? 'bg-amber-500 animate-ping' : 'bg-slate-400'}`}></span>
+                {status === 'streaming' ? 'Live Streaming' : status === 'connecting' ? 'Connecting' : status === 'stopped' ? 'Stopped' : 'Ready'}
+              </span>
+              <span className="font-semibold text-slate-800">
+                Live Monitor: <strong className="text-sky-900">{selectedSymbols.length}</strong> tickers active
+              </span>
+              <span className="text-slate-300 hidden sm:inline">•</span>
+              <span className="text-slate-600 font-mono text-[11px] hidden sm:inline">
+                Captured: <strong className="text-slate-800">{tickCount.toLocaleString()}</strong> session ticks
+              </span>
+              <span className="text-slate-300 hidden md:inline">•</span>
+              <span className="text-slate-600 font-mono text-[11px] hidden md:inline">
+                SQLite WAL: <strong className="text-slate-800">{dbStats?.totalTicks ? dbStats.totalTicks.toLocaleString() : 'Active'}</strong> ticks stored
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2 font-mono text-[11px] text-slate-600 flex-wrap">
+              <span className="px-2 py-0.5 rounded-md bg-sky-50 border border-sky-200 text-sky-800 font-bold">
+                Granularity: {granularity.toUpperCase()}
+              </span>
+              <span className="text-slate-300 hidden sm:inline">•</span>
+              <span className="text-slate-700">
+                1s & 1m OHLCV Auto-Resampling Engine
+              </span>
+            </div>
+          </>
+        )}
+
+        {/* Tab 2: Stock Screener */}
+        {platformTab === 'screener' && (
+          <>
+            <div className="flex items-center gap-2.5 flex-wrap">
+              <span className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-mono font-bold bg-purple-100 text-purple-900 border border-purple-300 uppercase tracking-wider">
+                <SlidersHorizontal className="w-3 h-3 text-purple-600" />
+                Nifty 500 Scanner
+              </span>
+              <span className="font-semibold text-slate-800">
+                Real-time cloud quote scanner with 4s rolling cache
+              </span>
+              <span className="text-slate-300 hidden sm:inline">•</span>
+              <span className="text-slate-600 text-[11px] hidden sm:inline">
+                Auto-evaluating Volume Surges, 52W Proximity & Spreads
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2 font-mono text-[11px] text-purple-950 flex-wrap">
+              <span className="px-2 py-0.5 rounded-md bg-purple-50 border border-purple-200 text-purple-900 font-semibold">
+                RSI • VWAP • High/Low Extremes
+              </span>
+              <span className="text-slate-300 hidden sm:inline">•</span>
+              <span className="text-amber-800 font-semibold flex items-center gap-1">
+                <Sparkles className="w-3 h-3 text-amber-500" />
+                Smart Money Detection Active
+              </span>
+            </div>
+          </>
+        )}
+
+        {/* Tab 3: Trading Dashboard */}
+        {platformTab === 'trading' && (
+          <>
+            <div className="flex items-center gap-2.5 flex-wrap">
+              <span className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-mono font-bold bg-emerald-100 text-emerald-900 border border-emerald-300 uppercase tracking-wider">
+                <Zap className="w-3 h-3 text-emerald-600" />
+                Execution Engine
+              </span>
+              <span className="font-semibold text-slate-800">
+                Target Symbol: <strong className="font-mono text-emerald-900">{tradeTargetSymbol}</strong>
+              </span>
+              <span className="text-slate-300 hidden sm:inline">•</span>
+              <span className="text-slate-600 text-[11px] hidden sm:inline">
+                Mode: <strong className="text-slate-800">Hybrid Paper & Broker Order Placement</strong>
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2 font-mono text-[11px] text-slate-600 flex-wrap">
+              <span className="px-2 py-0.5 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-900 font-semibold">
+                Mark-to-Market P&L
+              </span>
+              <span className="text-slate-300 hidden sm:inline">•</span>
+              <span className="text-slate-700">
+                Instant Square-Off & Margin Shield Active
+              </span>
+            </div>
+          </>
+        )}
+
+        {/* Tab 4: Smart Money Trail */}
+        {platformTab === 'smart_money' && (
+          <>
+            <div className="flex items-center gap-2.5 flex-wrap">
+              <span className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-mono font-bold bg-amber-100 text-amber-950 border border-amber-300 uppercase tracking-wider">
+                <Sparkles className="w-3 h-3 text-amber-600" />
+                Smart Money Radar
+              </span>
+              <span className="font-semibold text-slate-800">
+                Tracking continuous 6–8 month accumulation trails (HFCL, Tejas, Kaynes, Subex, CDSL)
+              </span>
+              <span className="text-slate-300 hidden sm:inline">•</span>
+              <span className="text-amber-900 text-[11px] font-mono hidden sm:inline font-bold">
+                Wyckoff Absorption & Block Order Footprints
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2 font-mono text-[11px] text-amber-950 flex-wrap">
+              <span className="px-2 py-0.5 rounded-md bg-amber-50 border border-amber-200 text-amber-900 font-semibold">
+                1–2 Line Excerpt Stream
+              </span>
+              <span className="text-slate-300 hidden sm:inline">•</span>
+              <span className="text-slate-700">
+                Zero Tick Bloat • Multi-Sheet Excel Exports (.xlsx)
+              </span>
+            </div>
+          </>
+        )}
+
+        {/* Tab 5: Server Logs */}
+        {platformTab === 'logs' && (
+          <>
+            <div className="flex items-center gap-2.5 flex-wrap">
+              <span className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[10px] font-mono font-bold bg-slate-800 text-amber-300 border border-amber-500/40 uppercase tracking-wider">
+                <Terminal className="w-3 h-3 text-amber-400" />
+                Supervisor Gateway
+              </span>
+              <span className="font-semibold text-slate-800">
+                Gateway: <strong className="font-mono text-sky-900">Port 3000</strong> → Worker Proxy: <strong className="font-mono text-sky-900">Port 3001</strong>
+              </span>
+              <span className="text-slate-300 hidden sm:inline">•</span>
+              <span className="text-slate-600 font-mono text-[11px] hidden sm:inline">
+                Live SSE Log Streaming Active
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2 font-mono text-[11px] text-slate-600 flex-wrap">
+              <span className="px-2 py-0.5 rounded-md bg-slate-100 border border-slate-300 text-slate-800 font-semibold">
+                Process Tree Watchdog
+              </span>
+              <span className="text-slate-300 hidden sm:inline">•</span>
+              <span className="text-slate-700">
+                Auto Restart & Windows taskkill Lifecycle Management
+              </span>
+            </div>
+          </>
+        )}
       </footer>
 
       {/* FYERS Token Generator Modal */}
@@ -2686,6 +3076,77 @@ export default function App() {
               </button>
             </div>
 
+            {/* Database Health & 7-Day Storage Pruner */}
+            <div className="p-4 rounded-2xl bg-gradient-to-br from-indigo-50/80 via-slate-50 to-sky-50/60 border border-indigo-200/80 shadow-xs flex flex-col gap-3">
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <div className="w-8 h-8 rounded-xl bg-indigo-600 text-white flex items-center justify-center shadow-xs shrink-0">
+                    <Database className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-bold text-xs text-slate-900">SQLite Storage & Maintenance</span>
+                      <span className="px-1.5 py-0.5 rounded-md bg-indigo-100 text-indigo-800 text-[10px] font-mono font-bold">
+                        {sqliteStats ? `${sqliteStats.dbSizeMB} MB` : 'Loading...'}
+                      </span>
+                    </div>
+                    <p className="text-[11px] text-slate-500 font-medium">
+                      Auto-prunes 1s ticks older than 7d · Retains 1m bars 90d · Orders & Smart Money permanent
+                    </p>
+                  </div>
+                </div>
+
+                <button
+                  disabled={optimizingDb}
+                  onClick={() => handleOptimizeDb(7)}
+                  className="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors shrink-0"
+                  title="Prune ticks older than 7 days and reclaim disk space with SQLite VACUUM"
+                >
+                  {optimizingDb ? (
+                    <>
+                      <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                      <span>Optimizing...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="w-3.5 h-3.5" />
+                      <span>Prune & Optimize</span>
+                    </>
+                  )}
+                </button>
+              </div>
+
+              {/* Live Metric Pills */}
+              {sqliteStats && (
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 border-t border-indigo-100/80 text-[11px] font-mono">
+                  <div className="bg-white/80 p-2 rounded-xl border border-indigo-100/60 flex flex-col">
+                    <span className="text-slate-400 text-[10px]">RAW TICKS</span>
+                    <span className="font-bold text-slate-800 text-xs mt-0.5">{sqliteStats.totalTicks.toLocaleString()}</span>
+                  </div>
+                  <div className="bg-white/80 p-2 rounded-xl border border-indigo-100/60 flex flex-col">
+                    <span className="text-slate-400 text-[10px]">1S BARS</span>
+                    <span className="font-bold text-slate-800 text-xs mt-0.5">{sqliteStats.totalBars1s.toLocaleString()}</span>
+                  </div>
+                  <div className="bg-white/80 p-2 rounded-xl border border-indigo-100/60 flex flex-col">
+                    <span className="text-slate-400 text-[10px]">1M BARS</span>
+                    <span className="font-bold text-slate-800 text-xs mt-0.5">{sqliteStats.totalBars1m.toLocaleString()}</span>
+                  </div>
+                  <div className="bg-white/80 p-2 rounded-xl border border-indigo-100/60 flex flex-col">
+                    <span className="text-slate-400 text-[10px]">SMART MONEY</span>
+                    <span className="font-bold text-indigo-700 text-xs mt-0.5">{sqliteStats.totalSmartMoney.toLocaleString()} events</span>
+                  </div>
+                </div>
+              )}
+
+              {/* Feedback Alert */}
+              {optimizeSuccessMsg && (
+                <div className="p-2.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs flex items-center gap-2 animate-in fade-in">
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                  <span>{optimizeSuccessMsg}</span>
+                </div>
+              )}
+            </div>
+
             {/* Backups List */}
             <div className="flex-1 overflow-y-auto pr-1 space-y-2.5">
               {backups.length === 0 ? (
@@ -2762,6 +3223,57 @@ export default function App() {
                 Close
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Real-time Global Smart Money Footprint Toast */}
+      {globalSmartMoneyAlert && (
+        <div className="fixed bottom-16 right-6 z-50 max-w-sm w-full p-4 rounded-2xl bg-gradient-to-r from-slate-900 via-amber-950 to-slate-950 border border-amber-400/80 shadow-2xl text-white animate-in slide-in-from-bottom-5 duration-300">
+          <div className="flex items-start justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <span className="w-2.5 h-2.5 rounded-full bg-amber-400 animate-ping"></span>
+              <span className="text-[10px] font-mono font-extrabold uppercase text-amber-300 tracking-wider">
+                Institutional Footprint Detected
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setGlobalSmartMoneyAlert(null)}
+              className="text-slate-400 hover:text-white text-xs cursor-pointer p-0.5"
+            >
+              ✕
+            </button>
+          </div>
+          <div className="mt-2 flex items-baseline justify-between font-mono">
+            <div className="text-base font-black text-amber-400">{globalSmartMoneyAlert.ticker}</div>
+            <div className="text-xs font-bold text-emerald-400">₹{globalSmartMoneyAlert.ltp}</div>
+          </div>
+          <p className="text-[11px] text-slate-300 mt-1 leading-snug">
+            {globalSmartMoneyAlert.pattern_type.replace(/_/g, ' ')} • {globalSmartMoneyAlert.note}
+          </p>
+          <div className="mt-3 flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                setRadarSelectedSymbol(globalSmartMoneyAlert.symbol);
+                setPlatformTab('smart_money');
+                setGlobalSmartMoneyAlert(null);
+              }}
+              className="flex-1 py-1.5 px-3 rounded-xl bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-400 hover:to-yellow-400 text-slate-950 font-bold text-xs shadow-sm cursor-pointer text-center"
+            >
+              Inspect in Radar →
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                handleSelectForTrade(globalSmartMoneyAlert.symbol, globalSmartMoneyAlert.ltp);
+                setGlobalSmartMoneyAlert(null);
+              }}
+              className="py-1.5 px-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-emerald-300 font-bold text-xs border border-emerald-500/30 cursor-pointer"
+            >
+              Trade
+            </button>
           </div>
         </div>
       )}

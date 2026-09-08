@@ -167,21 +167,42 @@ def _to_int(val):
         return None
 
 
+last_activity_time = time.time()
+reconnect_delay = 2.0
+MIN_RECONNECT_DELAY = 2.0
+MAX_RECONNECT_DELAY = 30.0
+BACKOFF_MULTIPLIER = 1.8
+
+
 def on_error(message):
     """Handle WebSocket errors."""
-    emit_event("error", {"message": str(message)})
+    msg_str = str(message)
+    lower = msg_str.lower()
+
+    if any(k in lower for k in ["401", "unauthorized", "token expired", "invalid_token", "invalid token", "expired", "-100"]):
+        emit_event("auth_error", {
+            "message": "FYERS Access Token has expired or is invalid. Please refresh token in Settings.",
+            "raw": msg_str
+        })
+    else:
+        emit_event("error", {"message": msg_str})
 
 
 def on_close(message):
     """Handle WebSocket close."""
-    emit_event("status", {"message": f"WebSocket disconnected. {message or ''}"})
+    global reconnect_delay
+    msg_str = str(message or "")
+    emit_event("status", {"message": f"WebSocket disconnected. {msg_str}".strip()})
     if is_running:
-        emit_event("status", {"message": "Reconnecting in 5 seconds..."})
+        emit_event("status", {"message": f"Reconnecting in {reconnect_delay:.1f}s (backoff active)..."})
 
 
 def on_open():
     """Handle successful connection."""
-    emit_event("status", {"message": "Connected successfully."})
+    global reconnect_delay, last_activity_time
+    reconnect_delay = MIN_RECONNECT_DELAY
+    last_activity_time = time.time()
+    emit_event("status", {"message": "Connected successfully to FYERS WebSocket."})
     emit_event("status", {"message": f"Subscribing to symbols: {', '.join(symbols)}..."})
     try:
         if fyers_socket:
@@ -210,7 +231,7 @@ signal.signal(signal.SIGTERM, handle_exit)
 
 
 def main():
-    global fyers_socket, is_running
+    global fyers_socket, is_running, reconnect_delay, last_activity_time
 
     emit_event("status", {"message": "Connecting to FYERS..."})
 
@@ -230,17 +251,39 @@ def main():
 
             fyers_socket.connect()
 
-            # Keep alive while connected
+            # Keep alive and send periodic heartbeat if idle
+            last_heartbeat = time.time()
             while is_running:
                 time.sleep(1)
+                now = time.time()
+                # If no ticks for 15s, emit heartbeat ping
+                if now - last_heartbeat >= 15:
+                    emit_event("heartbeat", {
+                        "status": "alive",
+                        "symbols": len(symbols),
+                        "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+                    })
+                    last_heartbeat = now
 
         except Exception as e:
             if not is_running:
                 break
-            emit_event("error", {"message": str(e)})
+            err_str = str(e)
+            if any(k in err_str.lower() for k in ["401", "unauthorized", "token expired", "invalid_token"]):
+                emit_event("auth_error", {
+                    "message": "FYERS Access Token expired. Please refresh credentials.",
+                    "detail": err_str
+                })
+                # On auth error, exit to avoid hammering API
+                time.sleep(3)
+                sys.exit(2)
+            else:
+                emit_event("error", {"message": err_str})
 
         if is_running:
-            time.sleep(5)
+            time.sleep(reconnect_delay)
+            # Apply exponential backoff up to max
+            reconnect_delay = min(MAX_RECONNECT_DELAY, reconnect_delay * BACKOFF_MULTIPLIER)
 
 
 if __name__ == "__main__":
