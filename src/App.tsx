@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import * as XLSX from 'xlsx';
 import {
   Play,
@@ -24,6 +25,7 @@ import {
   XCircle,
   Clock,
   Key,
+  Radio,
   ExternalLink,
   Eye,
   EyeOff,
@@ -122,8 +124,9 @@ export default function App() {
     typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted'
   );
 
-  // Fyers Token Generator Modal States
+  // Fyers Token Generator Modal States (Dual Tabs: Price Fetch Token & Trading Token)
   const [isTokenModalOpen, setIsTokenModalOpen] = useState<boolean>(false);
+  const [tokenAppType, setTokenAppType] = useState<'priceFetch' | 'trading'>('priceFetch');
   const [authConfig, setAuthConfig] = useState<{
     appId: string;
     hasSecretKey: boolean;
@@ -131,10 +134,26 @@ export default function App() {
     hasClientId: boolean;
     tokenPreview: string | null;
     defaultRedirectUri: string;
+    priceFetch?: {
+      appId: string;
+      hasSecretKey: boolean;
+      hasToken: boolean;
+      hasClientId: boolean;
+      tokenPreview: string | null;
+    };
+    trading?: {
+      appId: string;
+      hasSecretKey: boolean;
+      hasToken: boolean;
+      hasClientId: boolean;
+      tokenPreview: string | null;
+    };
   } | null>(null);
-  const [tokenAppId, setTokenAppId] = useState<string>('');
-  const [tokenSecretKey, setTokenSecretKey] = useState<string>('');
-  const [tokenRedirectUri, setTokenRedirectUri] = useState<string>('http://localhost:3000/api/fyers/callback');
+  const [priceAppId, setPriceAppId] = useState<string>('');
+  const [priceSecretKey, setPriceSecretKey] = useState<string>('');
+  const [tradeAppId, setTradeAppId] = useState<string>('');
+  const [tradeSecretKey, setTradeSecretKey] = useState<string>('');
+  const [tokenRedirectUri, setTokenRedirectUri] = useState<string>('https://127.0.0.1');
   const [tokenAuthCode, setTokenAuthCode] = useState<string>('');
   const [showSecret, setShowSecret] = useState<boolean>(false);
   const [saveSecretKey, setSaveSecretKey] = useState<boolean>(true);
@@ -142,11 +161,13 @@ export default function App() {
   const [tokenError, setTokenError] = useState<string | null>(null);
   const [tokenSuccessMsg, setTokenSuccessMsg] = useState<string | null>(null);
   const [authTab, setAuthTab] = useState<'1click' | 'manual'>('1click');
+  const [generatedAuthUrl, setGeneratedAuthUrl] = useState<string | null>(null);
 
   // Primary Platform Navigation Tab: 'monitor' | 'screener' | 'trading' | 'smart_money' | 'logs'
   const [platformTab, setPlatformTab] = useState<'monitor' | 'screener' | 'trading' | 'smart_money' | 'logs'>('monitor');
   const [tradeTargetSymbol, setTradeTargetSymbol] = useState<string>('NSE:RELIANCE-EQ');
   const [tradeTargetPrice, setTradeTargetPrice] = useState<number>(1310);
+  const [tradeTargetSide, setTradeTargetSide] = useState<'BUY' | 'SELL'>('BUY');
   const [globalSmartMoneyAlert, setGlobalSmartMoneyAlert] = useState<any | null>(null);
   const [radarSelectedSymbol, setRadarSelectedSymbol] = useState<string>('NSE:HFCL-EQ');
 
@@ -157,9 +178,10 @@ export default function App() {
     }
   };
 
-  const handleSelectForTrade = (sym: string, curPrice: number) => {
+  const handleSelectForTrade = (sym: string, curPrice: number, targetSide?: 'BUY' | 'SELL') => {
     setTradeTargetSymbol(sym);
     setTradeTargetPrice(curPrice);
+    if (targetSide) setTradeTargetSide(targetSide);
     setPlatformTab('trading');
   };
 
@@ -186,18 +208,9 @@ export default function App() {
   const niftyFuturesRef = useRef<HTMLDivElement | null>(null);
   const downloadMenuRef = useRef<HTMLDivElement | null>(null);
 
-  // Close dropdowns on click outside
+  // Close popovers on click outside
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
-      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
-        setIsDropdownOpen(false);
-      }
-      if (bankNiftyRef.current && !bankNiftyRef.current.contains(event.target as Node)) {
-        setIsBankNiftyOpen(false);
-      }
-      if (niftyFuturesRef.current && !niftyFuturesRef.current.contains(event.target as Node)) {
-        setIsNiftyFuturesOpen(false);
-      }
       if (downloadMenuRef.current && !downloadMenuRef.current.contains(event.target as Node)) {
         setDownloadMenuOpen(false);
       }
@@ -242,7 +255,10 @@ export default function App() {
       if (res.ok) {
         const data = await res.json();
         setAuthConfig(data);
-        if (data.appId && !tokenAppId) setTokenAppId(data.appId);
+        const pId = data.priceFetch?.appId || data.appId;
+        const tId = data.trading?.appId;
+        if (pId && !priceAppId) setPriceAppId(pId);
+        if (tId && !tradeAppId) setTradeAppId(tId);
         if (data.defaultRedirectUri && !tokenRedirectUri) setTokenRedirectUri(data.defaultRedirectUri);
       }
     } catch { }
@@ -358,11 +374,16 @@ export default function App() {
 
   // 1-Click Browser OAuth
   const handle1ClickLogin = async () => {
-    if (!tokenAppId.trim()) {
-      setTokenError('App ID is required');
+    const isTrade = tokenAppType === 'trading';
+    const curAppId = isTrade ? tradeAppId : priceAppId;
+    const curSecret = isTrade ? tradeSecretKey : priceSecretKey;
+    const curConfig = isTrade ? authConfig?.trading : (authConfig?.priceFetch || authConfig);
+
+    if (!curAppId.trim()) {
+      setTokenError(`${isTrade ? 'Algo Trading' : 'Price Fetch'} App ID is required`);
       return;
     }
-    if (!tokenSecretKey.trim() && !authConfig?.hasSecretKey) {
+    if (!curSecret.trim() && !curConfig?.hasSecretKey) {
       setTokenError('Secret Key is required to exchange the token');
       return;
     }
@@ -373,33 +394,45 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          appId: tokenAppId.trim(),
-          secretKey: tokenSecretKey.trim(),
+          appId: curAppId.trim(),
+          secretKey: curSecret.trim(),
           redirectUri: tokenRedirectUri.trim(),
+          appType: tokenAppType,
         }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to generate auth URL');
+
+      setGeneratedAuthUrl(data.authUrl);
 
       // Open OAuth login popup
       const width = 560;
       const height = 720;
       const left = window.screenX + (window.outerWidth - width) / 2;
       const top = window.screenY + (window.outerHeight - height) / 2;
-      window.open(data.authUrl, 'fyers_oauth_login', `width=${width},height=${height},left=${left},top=${top},menubar=no,status=no,toolbar=no`);
+      const popup = window.open(data.authUrl, 'fyers_oauth_login', `width=${width},height=${height},left=${left},top=${top},menubar=no,status=no,toolbar=no`);
+      if (!popup || popup.closed || typeof popup.closed === 'undefined') {
+        setTokenError('Popup was blocked by your browser. Please click "Open Login in New Tab" below.');
+      }
     } catch (err: any) {
       setTokenError(err.message || String(err));
+    } finally {
       setTokenLoading(false);
     }
   };
 
   // Manual Exchange for custom redirect URI (e.g. https://127.0.0.1)
   const handleManualExchange = async () => {
-    if (!tokenAppId.trim()) {
-      setTokenError('App ID is required');
+    const isTrade = tokenAppType === 'trading';
+    const curAppId = isTrade ? tradeAppId : priceAppId;
+    const curSecret = isTrade ? tradeSecretKey : priceSecretKey;
+    const curConfig = isTrade ? authConfig?.trading : (authConfig?.priceFetch || authConfig);
+
+    if (!curAppId.trim()) {
+      setTokenError(`${isTrade ? 'Algo Trading' : 'Price Fetch'} App ID is required`);
       return;
     }
-    if (!tokenSecretKey.trim() && !authConfig?.hasSecretKey) {
+    if (!curSecret.trim() && !curConfig?.hasSecretKey) {
       setTokenError('Secret Key is required');
       return;
     }
@@ -414,15 +447,16 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          appId: tokenAppId.trim(),
-          secretKey: tokenSecretKey.trim(),
+          appId: curAppId.trim(),
+          secretKey: curSecret.trim(),
           authCodeOrUrl: tokenAuthCode.trim(),
           saveSecret: saveSecretKey,
+          appType: tokenAppType,
         }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to exchange token');
-      setTokenSuccessMsg(data.message || 'Token saved successfully!');
+      setTokenSuccessMsg(data.message || `${isTrade ? 'Trading' : 'Price Fetch'} token saved successfully!`);
       setTokenAuthCode('');
       fetchAuthConfig();
       setTimeout(() => {
@@ -1593,15 +1627,15 @@ export default function App() {
                 </button>
 
                 {/* Expanded Nifty 500 Dropdown Modal */}
-                {isDropdownOpen && (
+                {isDropdownOpen && typeof document !== 'undefined' && createPortal(
                   <div
-                    className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/60 backdrop-blur-xs animate-in fade-in duration-150"
+                    className="fixed inset-0 z-[100] flex items-center justify-center p-4 sm:p-6 bg-slate-950/60 backdrop-blur-sm animate-in fade-in duration-150"
                     onClick={(e) => {
                       if (e.target === e.currentTarget) setIsDropdownOpen(false);
                     }}
                   >
                     <div
-                      className="relative w-full sm:w-[560px] md:w-[640px] max-h-[85vh] flex flex-col web2-card p-5 sm:p-6 rounded-3xl shadow-2xl border border-sky-300/90 bg-white/98 backdrop-blur-2xl"
+                      className="relative w-full max-w-2xl max-h-[85vh] flex flex-col web2-card p-5 sm:p-6 rounded-3xl shadow-2xl border border-sky-300/90 bg-white/98 backdrop-blur-2xl"
                       onClick={(e) => e.stopPropagation()}
                     >
                       {/* Modal Header */}
@@ -1800,7 +1834,8 @@ export default function App() {
                       </div>
 
                     </div>
-                  </div>
+                  </div>,
+                  document.body
                 )}
               </div>
 
@@ -1838,15 +1873,15 @@ export default function App() {
                 </button>
 
                 {/* Expanded Bank Nifty Dropdown Modal */}
-                {isBankNiftyOpen && (
+                {isBankNiftyOpen && typeof document !== 'undefined' && createPortal(
                   <div
-                    className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/60 backdrop-blur-xs animate-in fade-in duration-150"
+                    className="fixed inset-0 z-[100] flex items-center justify-center p-4 sm:p-6 bg-slate-950/60 backdrop-blur-sm animate-in fade-in duration-150"
                     onClick={(e) => {
                       if (e.target === e.currentTarget) setIsBankNiftyOpen(false);
                     }}
                   >
                     <div
-                      className="relative w-full sm:w-[560px] md:w-[640px] max-h-[85vh] flex flex-col web2-card p-5 sm:p-6 rounded-3xl shadow-2xl border border-emerald-300/90 bg-white/98 backdrop-blur-2xl"
+                      className="relative w-full max-w-2xl max-h-[85vh] flex flex-col web2-card p-5 sm:p-6 rounded-3xl shadow-2xl border border-emerald-300/90 bg-white/98 backdrop-blur-2xl"
                       onClick={(e) => e.stopPropagation()}
                     >
                       {/* Modal Header */}
@@ -1997,7 +2032,8 @@ export default function App() {
                       </div>
 
                     </div>
-                  </div>
+                  </div>,
+                  document.body
                 )}
               </div>
 
@@ -2035,15 +2071,15 @@ export default function App() {
                 </button>
 
                 {/* Expanded Nifty Futures Dropdown Modal */}
-                {isNiftyFuturesOpen && (
+                {isNiftyFuturesOpen && typeof document !== 'undefined' && createPortal(
                   <div
-                    className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/60 backdrop-blur-xs animate-in fade-in duration-150"
+                    className="fixed inset-0 z-[100] flex items-center justify-center p-4 sm:p-6 bg-slate-950/60 backdrop-blur-sm animate-in fade-in duration-150"
                     onClick={(e) => {
                       if (e.target === e.currentTarget) setIsNiftyFuturesOpen(false);
                     }}
                   >
                     <div
-                      className="relative w-full sm:w-[560px] md:w-[640px] max-h-[85vh] flex flex-col web2-card p-5 sm:p-6 rounded-3xl shadow-2xl border border-purple-300/90 bg-white/98 backdrop-blur-2xl"
+                      className="relative w-full max-w-2xl max-h-[85vh] flex flex-col web2-card p-5 sm:p-6 rounded-3xl shadow-2xl border border-purple-300/90 bg-white/98 backdrop-blur-2xl"
                       onClick={(e) => e.stopPropagation()}
                     >
                       {/* Modal Header */}
@@ -2211,7 +2247,8 @@ export default function App() {
                       </div>
 
                     </div>
-                  </div>
+                  </div>,
+                  document.body
                 )}
               </div>
             </section>
@@ -2645,6 +2682,7 @@ export default function App() {
           <TradingDashboard
             initialSymbol={tradeTargetSymbol}
             initialPrice={tradeTargetPrice}
+            initialSide={tradeTargetSide}
             availableSymbols={selectedSymbols}
           />
         )}
@@ -2826,9 +2864,9 @@ export default function App() {
       </footer>
 
       {/* FYERS Token Generator Modal */}
-      {isTokenModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/60 backdrop-blur-sm animate-in fade-in duration-200">
-          <div className="relative w-full max-w-lg bg-white/95 rounded-3xl border border-sky-200 shadow-2xl p-6 sm:p-7 flex flex-col gap-5 text-slate-800">
+      {isTokenModalOpen && typeof document !== 'undefined' && createPortal(
+        <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-slate-950/60 backdrop-blur-sm animate-in fade-in duration-200">
+          <div className="relative w-full max-w-lg max-h-[90vh] overflow-y-auto bg-white/98 rounded-3xl border border-sky-300 shadow-2xl p-6 sm:p-7 flex flex-col gap-4 text-slate-800">
 
             {/* Header */}
             <div className="flex items-start justify-between gap-3">
@@ -2854,29 +2892,105 @@ export default function App() {
               </button>
             </div>
 
-            {/* Token Status Pill */}
-            <div className="flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-slate-50 border border-slate-200 text-xs font-mono">
-              <span className="text-slate-600">Current Status:</span>
-              <span className={`font-bold flex items-center gap-1.5 ${authConfig?.hasToken ? 'text-emerald-700' : 'text-amber-700'}`}>
-                {authConfig?.hasToken ? (
-                  <>
-                    <ShieldCheck className="w-4 h-4 text-emerald-600" />
-                    <span>Active ({authConfig.tokenPreview})</span>
-                  </>
-                ) : (
-                  <>
-                    <AlertCircle className="w-4 h-4 text-amber-600" />
-                    <span>Missing / Expired</span>
-                  </>
-                )}
-              </span>
+            {/* Primary App Mode Tabs: Price Fetch Token vs Trading Token */}
+            <div className="grid grid-cols-2 gap-2 p-1.5 rounded-2xl bg-slate-100 border border-slate-200">
+              <button
+                type="button"
+                onClick={() => {
+                  setTokenAppType('priceFetch');
+                  setTokenError(null);
+                  setTokenSuccessMsg(null);
+                }}
+                className={`flex flex-col items-center justify-center py-2.5 px-3 rounded-xl transition-all cursor-pointer ${
+                  tokenAppType === 'priceFetch'
+                    ? 'bg-white text-sky-950 shadow-md shadow-slate-200/60 border border-sky-200'
+                    : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
+                }`}
+              >
+                <div className="flex items-center gap-2 font-bold text-xs">
+                  <Radio className="w-3.5 h-3.5 text-sky-600" />
+                  <span>Price Fetch Token</span>
+                </div>
+                <span className="text-[10px] text-slate-500 font-medium mt-0.5">
+                  Quotes, WebSockets & Screener
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setTokenAppType('trading');
+                  setTokenError(null);
+                  setTokenSuccessMsg(null);
+                }}
+                className={`flex flex-col items-center justify-center py-2.5 px-3 rounded-xl transition-all cursor-pointer ${
+                  tokenAppType === 'trading'
+                    ? 'bg-white text-emerald-950 shadow-md shadow-slate-200/60 border border-emerald-200'
+                    : 'text-slate-600 hover:text-slate-900 hover:bg-white/60'
+                }`}
+              >
+                <div className="flex items-center gap-2 font-bold text-xs">
+                  <Zap className="w-3.5 h-3.5 text-emerald-600" />
+                  <span>Trading Token</span>
+                </div>
+                <span className="text-[10px] text-slate-500 font-medium mt-0.5">
+                  Live Orders & Algo OMS
+                </span>
+              </button>
             </div>
 
-            {/* Tabs: 1-Click OAuth vs Manual Paste */}
+            {/* Token Status Pill & Purpose Context */}
+            {(() => {
+              const isTrade = tokenAppType === 'trading';
+              const curConfig = isTrade ? authConfig?.trading : (authConfig?.priceFetch || authConfig);
+              const hasTok = Boolean(curConfig?.hasToken);
+              const preview = curConfig?.tokenPreview;
+
+              return (
+                <div className="flex flex-col gap-2">
+                  <div className="flex items-center justify-between px-3.5 py-2.5 rounded-xl bg-slate-50 border border-slate-200 text-xs font-mono">
+                    <span className="text-slate-600">
+                      {isTrade ? 'Trading OMS Status:' : 'Market Data Status:'}
+                    </span>
+                    <span className={`font-bold flex items-center gap-1.5 ${hasTok ? 'text-emerald-700' : 'text-amber-700'}`}>
+                      {hasTok ? (
+                        <>
+                          <ShieldCheck className="w-4 h-4 text-emerald-600" />
+                          <span>Active {preview ? `(${preview})` : ''}</span>
+                        </>
+                      ) : (
+                        <>
+                          <AlertCircle className="w-4 h-4 text-amber-600" />
+                          <span>Missing / Expired</span>
+                        </>
+                      )}
+                    </span>
+                  </div>
+
+                  <div className={`px-3 py-2 rounded-xl text-[11px] leading-relaxed border ${
+                    isTrade 
+                      ? 'bg-emerald-50/70 border-emerald-200 text-emerald-900' 
+                      : 'bg-sky-50/70 border-sky-200 text-sky-900'
+                  }`}>
+                    {isTrade ? (
+                      <span>
+                        ⚡ <strong>Live Order Execution:</strong> Used by the Trading Desk for real broker orders. Requires Whitelisting IP <code className="bg-emerald-100 px-1 py-0.5 rounded font-mono font-bold text-emerald-950">49.206.45.85</code> in your FYERS Algo App.
+                      </span>
+                    ) : (
+                      <span>
+                        📊 <strong>Market Data Feed:</strong> Powers live tick streaming, screener, and quotes. No IP whitelisting needed.
+                      </span>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
+
+            {/* Sub-Tabs: 1-Click OAuth vs Manual Paste */}
             <div className="flex items-center rounded-xl bg-slate-100 p-1 border border-slate-200 text-xs font-bold">
               <button
                 type="button"
-                onClick={() => setAuthTab('1click')}
+                onClick={() => { setAuthTab('1click'); setTokenLoading(false); setTokenError(null); }}
                 className={`flex-1 py-1.5 rounded-lg transition-all flex items-center justify-center gap-1.5 cursor-pointer ${authTab === '1click'
                   ? 'bg-white text-sky-950 shadow-xs'
                   : 'text-slate-600 hover:text-slate-900'
@@ -2887,7 +3001,7 @@ export default function App() {
               </button>
               <button
                 type="button"
-                onClick={() => setAuthTab('manual')}
+                onClick={() => { setAuthTab('manual'); setTokenLoading(false); setTokenError(null); }}
                 className={`flex-1 py-1.5 rounded-lg transition-all flex items-center justify-center gap-1.5 cursor-pointer ${authTab === 'manual'
                   ? 'bg-white text-sky-950 shadow-xs'
                   : 'text-slate-600 hover:text-slate-900'
@@ -2903,13 +3017,13 @@ export default function App() {
               {/* App ID */}
               <div>
                 <label className="block font-bold text-slate-700 mb-1">
-                  FYERS App ID <span className="text-rose-500">*</span>
+                  {tokenAppType === 'trading' ? 'FYERS Algo Trading App ID' : 'FYERS Market Data App ID'} <span className="text-rose-500">*</span>
                 </label>
                 <input
                   type="text"
-                  value={tokenAppId}
-                  onChange={(e) => setTokenAppId(e.target.value)}
-                  placeholder="e.g. VX4SHQQSBA-100"
+                  value={tokenAppType === 'trading' ? tradeAppId : priceAppId}
+                  onChange={(e) => tokenAppType === 'trading' ? setTradeAppId(e.target.value) : setPriceAppId(e.target.value)}
+                  placeholder={tokenAppType === 'trading' ? 'e.g. YOUR_ALGO_APP_ID-100' : 'e.g. VX4SHQQSBA-100'}
                   className="w-full px-3 py-2 rounded-xl border border-slate-300 font-mono text-xs focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 bg-white"
                 />
               </div>
@@ -2918,18 +3032,28 @@ export default function App() {
               <div>
                 <div className="flex items-center justify-between mb-1">
                   <label className="font-bold text-slate-700">
-                    Secret Key <span className="text-rose-500">*</span>
+                    {tokenAppType === 'trading' ? 'Algo Trading Secret Key' : 'Market Data Secret Key'} <span className="text-rose-500">*</span>
                   </label>
-                  {authConfig?.hasSecretKey && !tokenSecretKey && (
-                    <span className="text-[11px] text-emerald-600 font-medium">✓ Saved in .env</span>
-                  )}
+                  {(() => {
+                    const isTrade = tokenAppType === 'trading';
+                    const hasSavedSecret = isTrade ? authConfig?.trading?.hasSecretKey : (authConfig?.priceFetch?.hasSecretKey || authConfig?.hasSecretKey);
+                    const curSecret = isTrade ? tradeSecretKey : priceSecretKey;
+                    if (hasSavedSecret && !curSecret) {
+                      return <span className="text-[11px] text-emerald-600 font-medium">✓ Saved in .env</span>;
+                    }
+                    return null;
+                  })()}
                 </div>
                 <div className="relative">
                   <input
                     type={showSecret ? "text" : "password"}
-                    value={tokenSecretKey}
-                    onChange={(e) => setTokenSecretKey(e.target.value)}
-                    placeholder={authConfig?.hasSecretKey ? "Using saved secret key (or enter new)" : "Enter Secret Key from Fyers"}
+                    value={tokenAppType === 'trading' ? tradeSecretKey : priceSecretKey}
+                    onChange={(e) => tokenAppType === 'trading' ? setTradeSecretKey(e.target.value) : setPriceSecretKey(e.target.value)}
+                    placeholder={
+                      (tokenAppType === 'trading' ? authConfig?.trading?.hasSecretKey : (authConfig?.priceFetch?.hasSecretKey || authConfig?.hasSecretKey))
+                        ? "Using saved secret key (or enter new)"
+                        : "Enter Secret Key from Fyers"
+                    }
                     className="w-full px-3 py-2 pr-10 rounded-xl border border-slate-300 font-mono text-xs focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 bg-white"
                   />
                   <button
@@ -2956,7 +3080,7 @@ export default function App() {
                       className="w-full px-3 py-2 rounded-xl border border-slate-200 font-mono text-[11px] text-slate-600 bg-slate-50 focus:outline-none"
                     />
                     <p className="text-[10px] text-slate-500 mt-1 leading-normal">
-                      💡 Ensure this redirect URI is added in your <a href="https://myapi.fyers.in" target="_blank" rel="noreferrer" className="text-sky-600 underline">Fyers API Dashboard</a> for true 1-click automatic token generation.
+                      💡 Must match your App Redirect URL in <a href="https://myapi.fyers.in" target="_blank" rel="noreferrer" className="text-sky-600 underline">myapi.fyers.in</a>. If you registered <code className="bg-slate-100 px-1 py-0.5 rounded text-sky-800">https://127.0.0.1</code>, switch to the <strong>Manual Paste</strong> tab above.
                     </p>
                   </div>
 
@@ -2964,27 +3088,85 @@ export default function App() {
                     type="button"
                     onClick={handle1ClickLogin}
                     disabled={tokenLoading}
-                    className="mt-1 w-full py-2.5 rounded-xl font-bold text-sm text-white glossy-btn-sky flex items-center justify-center gap-2 cursor-pointer shadow-md disabled:opacity-60"
+                    className={`mt-1 w-full py-3 px-4 rounded-xl font-bold text-sm text-white shadow-md flex items-center justify-center gap-2 cursor-pointer transition-all disabled:opacity-60 ${
+                      tokenAppType === 'trading'
+                        ? 'bg-gradient-to-r from-emerald-600 via-teal-600 to-emerald-700 hover:from-emerald-500 hover:to-teal-500 shadow-emerald-600/30'
+                        : 'bg-gradient-to-r from-sky-600 via-sky-500 to-cyan-600 hover:from-sky-500 hover:to-cyan-500 shadow-sky-500/30'
+                    }`}
                   >
                     {tokenLoading ? (
-                      <span>Launching Fyers Login...</span>
+                      <span>Connecting to FYERS...</span>
                     ) : (
                       <>
-                        <Sparkles className="w-4 h-4" />
-                        <span>Login with FYERS (1-Click)</span>
+                        <Sparkles className="w-4 h-4 text-amber-200" />
+                        <span>{tokenAppType === 'trading' ? 'Authorize Trading App (1-Click)' : 'Login with FYERS (1-Click)'}</span>
                       </>
                     )}
                   </button>
+
+                  {generatedAuthUrl && (
+                    <a
+                      href={generatedAuthUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="w-full py-2.5 px-3 rounded-xl border border-sky-300 bg-sky-50 text-sky-800 text-xs font-semibold flex items-center justify-center gap-2 hover:bg-sky-100 transition-colors shadow-xs"
+                    >
+                      <ExternalLink className="w-3.5 h-3.5" />
+                      <span>Open FYERS Login in New Tab</span>
+                    </a>
+                  )}
                 </div>
               )}
 
               {/* Tab 2: Manual Paste (for https://127.0.0.1) */}
               {authTab === 'manual' && (
                 <div className="flex flex-col gap-3 pt-1">
+                  <div className={`p-3.5 rounded-2xl border text-xs flex flex-col gap-2.5 shadow-xs ${
+                    tokenAppType === 'trading'
+                      ? 'bg-gradient-to-r from-emerald-50 via-teal-50 to-slate-50 border-emerald-200 text-emerald-950'
+                      : 'bg-gradient-to-r from-sky-50 via-cyan-50 to-blue-50 border-sky-200 text-sky-950'
+                  }`}>
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold text-xs flex items-center gap-1.5">
+                        <span>Step 1: Open FYERS Login</span>
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handle1ClickLogin}
+                      disabled={tokenLoading}
+                      className={`w-full py-2.5 px-4 rounded-xl font-bold text-xs text-white shadow-sm flex items-center justify-center gap-2 cursor-pointer transition-all disabled:opacity-60 ${
+                        tokenAppType === 'trading'
+                          ? 'bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500'
+                          : 'bg-gradient-to-r from-sky-600 to-cyan-600 hover:from-sky-500 hover:to-cyan-500'
+                      }`}
+                    >
+                      <ExternalLink className="w-4 h-4" />
+                      <span>Login with FYERS ({tokenAppType === 'trading' ? 'Trading App' : 'Data App'})</span>
+                    </button>
+                    <p className="text-[11px] opacity-90 leading-normal">
+                      Log in with your credentials on FYERS. When approved, FYERS redirects to <code className="bg-white/80 px-1 py-0.5 rounded font-mono text-[10px] font-bold">https://127.0.0.1/?auth_code=...</code>.
+                    </p>
+                    <p className="text-[10px] text-amber-800 bg-amber-50/90 p-2 rounded-lg border border-amber-200 leading-normal">
+                      ⚠️ <em>&ldquo;This site can&rsquo;t be reached&rdquo;</em> in your browser is <strong>normal</strong>! Just copy the address bar URL and paste it into Step 2 below.
+                    </p>
+                  </div>
+
                   <div>
-                    <label className="block font-bold text-slate-700 mb-1">
-                      Paste Redirect URL or Auth Code
-                    </label>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="font-bold text-slate-700">
+                        Step 2: Paste Redirect URL or Auth Code
+                      </label>
+                      {tokenAuthCode && (
+                        <button
+                          type="button"
+                          onClick={() => setTokenAuthCode('')}
+                          className="text-[11px] text-slate-400 hover:text-slate-600 underline cursor-pointer"
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </div>
                     <input
                       type="text"
                       value={tokenAuthCode}
@@ -2992,9 +3174,21 @@ export default function App() {
                       placeholder="Paste https://127.0.0.1/?auth_code=... or raw code"
                       className="w-full px-3 py-2 rounded-xl border border-slate-300 font-mono text-xs focus:outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 bg-white"
                     />
-                    <p className="text-[10px] text-slate-500 mt-1 leading-normal">
-                      If your Fyers app redirect URI is set to <code className="bg-slate-100 px-1 py-0.5 rounded text-sky-800">https://127.0.0.1</code>, complete your login, copy the address bar URL, and paste it here.
-                    </p>
+
+                    {/* Live Auth Code Detector Badge */}
+                    {(() => {
+                      const match = tokenAuthCode.match(/[?&]auth_code=([^&#\s]+)/);
+                      const code = match ? decodeURIComponent(match[1]) : (tokenAuthCode.includes('eyJ') ? tokenAuthCode.trim() : null);
+                      if (code && code !== '200') {
+                        return (
+                          <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-emerald-800 font-mono bg-emerald-50 border border-emerald-200 px-2.5 py-1 rounded-lg">
+                            <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                            <span className="truncate">Auth Code detected ({code.slice(0, 18)}... length {code.length})</span>
+                          </div>
+                        );
+                      }
+                      return null;
+                    })()}
                   </div>
 
                   <label className="flex items-center gap-2 text-xs text-slate-600 cursor-pointer">
@@ -3010,15 +3204,19 @@ export default function App() {
                   <button
                     type="button"
                     onClick={handleManualExchange}
-                    disabled={tokenLoading}
-                    className="mt-1 w-full py-2.5 rounded-xl font-bold text-sm text-white glossy-btn-emerald flex items-center justify-center gap-2 cursor-pointer shadow-md disabled:opacity-60"
+                    disabled={tokenLoading || !tokenAuthCode.trim()}
+                    className={`mt-1 w-full py-2.5 rounded-xl font-bold text-sm text-white flex items-center justify-center gap-2 cursor-pointer shadow-md disabled:opacity-50 ${
+                      tokenAppType === 'trading'
+                        ? 'bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500'
+                        : 'glossy-btn-emerald'
+                    }`}
                   >
                     {tokenLoading ? (
-                      <span>Exchanging Token...</span>
+                      <span>Validating with FYERS...</span>
                     ) : (
                       <>
                         <ShieldCheck className="w-4 h-4" />
-                        <span>Validate & Activate Token</span>
+                        <span>{tokenAppType === 'trading' ? 'Validate & Activate Trading Token' : 'Validate & Activate Price Fetch Token'}</span>
                       </>
                     )}
                   </button>
@@ -3043,7 +3241,8 @@ export default function App() {
             </div>
 
           </div>
-        </div>
+        </div>,
+        document.body
       )}
 
       {/* Past Sessions Archive & Backups Modal */}

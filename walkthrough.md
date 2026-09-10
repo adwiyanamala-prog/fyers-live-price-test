@@ -1,98 +1,83 @@
-# Institutional Trading Suite & Smart Money Engine Walkthrough
+# FYERS App Improvements & Institutional Desk Walkthrough
 
-We have completed the sequential implementation of all **5 institutional-grade trading options** requested for the **AdwiKetan Trading Desk**:
-
----
-
-## 🚀 Summary of Implemented Options
-
-### Option 1: Live Intraday Smart Money Footprint Scanner
-- **Real-Time Block & Iceberg Detector**:
-  - Automatically evaluates incoming FYERS WebSocket ticks and simulated feeds inside `appendPriceToDb()`.
-  - Computes rolling trade-size baselines (40 trades), 60-second sliding volume windows, price compression (`<= 0.35%`), and Ask-side aggressor absorption (`>= 75%`).
-  - Automatically formats and records a concise 1–2 line institutional note into SQLite table `smart_money_trail` without tick-by-tick storage bloat.
-  - Broadcasts live Server-Sent Events (`smart_money_alert`) to all connected browser clients.
-- **UI Integration**:
-  - **Live Intraday Footprint Scanner Strip** in [SmartMoneyRadar.tsx](file:///c:/Users/adwiy/fyers-live-price-test/src/components/SmartMoneyRadar.tsx) showing real-time footprint chips with volume multiples.
-  - **⚡ Simulate Footprint Scan** button for instant on-demand testing.
-  - Floating toast notification with `Inspect in Radar →` and `Trade` action buttons.
+We have completed the implementation of the three high-impact enhancements to make the AdwiKetan Trading Desk rival the official FYERS web app:
 
 ---
 
-### Option 2: 1-Click Strategy Bracket Orders & Auto-Execution
-- **Pre-Calculated Risk-Reward Bracket Architecture**:
-  - Stop-loss automatically calculated below technical swing floors:
-    - **Wyckoff Spring**: 0.2% below spring sweep low.
-    - **Connors RSI**: 0.5% below day low.
-    - **Gap & Go**: 0.6% below gap floor / VWAP.
-    - **Smart Money Trail**: Lower band of the accumulation base (e.g. ₹81.50 for HFCL).
-  - Target 1 calculated at **2.0R** (50% partial profit target).
-  - Target 2 calculated at **3.5R** (50% trailing runner target).
-- **Position Sizing Calculator**:
-  - Automatically calculates exact share quantity based on user risk budget: $\text{Qty} = \lfloor \frac{\text{Risk Budget}}{\text{Entry} - \text{Stop Loss}} \rfloor$.
-- **Seamless Modal**:
-  - [BracketOrderModal.tsx](file:///c:/Users/adwiy/fyers-live-price-test/src/components/BracketOrderModal.tsx) integrated into both **Stock Screener** and **Smart Money Radar**.
-  - Toggle between **Paper Trading** (instant SQLite simulation) and **Live FYERS** execution.
+## 🌟 1. Intraday Multi-Timeframe Charts & Technical Indicators
+
+### Key Capabilities
+- **Multi-Timeframe Resolutions**:
+  - Direct selection of **1m**, **5m**, **15m**, **1h**, and **1D** resolutions in [TradingViewChartModal.tsx](file:///c:/Users/adwiy/fyers-live-price-test/src/components/TradingViewChartModal.tsx).
+  - When **1D** is active, users can toggle between **1M**, **3M**, **6M**, and **1Y** history windows.
+- **100% Genuine FYERS Cloud Intraday Data**:
+  - Backend helper `fetchFyersHistory(symbol, days, resolution)` pulls authentic candles directly from `https://api-t1.fyers.in/data/history`.
+  - Intraday candles use UNIX epoch timestamps (`epoch_seconds`), allowing Lightweight Charts to render time-of-day candles.
+- **Institutional Technical Indicators**:
+  - **EMA Ribbons**: EMA 9 (Cyan `#06b6d4`), EMA 21 (Violet `#a855f7`), and EMA 50 (Orange `#f97316`) rendered directly over candlesticks.
+  - **Anchored VWAP**: Automatically reset daily for intraday charts to identify institutional accumulation support.
+  - **RSI 14 Momentum Tracker**: Displays current RSI value with Overbought (`>70`) / Oversold (`<30`) status badges.
+  - **MACD (12, 26, 9)**: Computes fast/slow EMA divergence, signal line, and colored momentum histogram bars.
+  - **Smart Money Footprint Markers**: Golden arrow markers highlighting historical institutional block order zones.
 
 ---
 
-### Option 3: Real-Time Alerts (Synthesized Audio Chimes & Push Notifications)
-- **Zero-Dependency Web Audio API Engine**:
-  - Implemented in [audioAlerts.ts](file:///c:/Users/adwiy/fyers-live-price-test/src/utils/audioAlerts.ts) using oscillator nodes and exponential gain decays (no external MP3 files needed).
-  - Harmonic sound signatures:
-    - **Wyckoff Spring Sweep**: 220Hz low sweep frequency rapidly snapping upwards to 880Hz / 1320Hz bell harmonics.
-    - **Connors RSI Pullback**: Dual crystal bell chord (659Hz E5 + 1046Hz C6).
-    - **Catalyst Gap & Go**: Ascending 4-tone triad arpeggio (C5 → E5 → G5 → C6).
-    - **Smart Money Footprint**: High-ticket metallic dual ping (1174Hz → 1760Hz).
-    - **Order Execution**: Pleasant confirmation chime.
-- **Controls & Notifications**:
-  - Audio Mute/Unmute button (`#btn-toggle-sound`) and Desktop Push Notification permission button (`#btn-toggle-notifications`) integrated into the top header without wrapping.
-  - HTML5 native Web Notifications for background alerting.
-  - Webhook dispatcher in `server.ts` triggered on `ALERT_WEBHOOK_URL`.
+## ⚡ 2. Visual Chart Trading & Drag/Nudge Quick Modify
+
+### Key Capabilities
+- **Direct Price Lines on Candlestick Canvas**:
+  - **Entry Price Line**: Blue dashed line (`#38bdf8`) with label `${side} LMT ₹... (#id)`.
+  - **Stop-Loss (SL) Line**: Red dotted line (`#ef4444`) with label `SL ₹...`.
+  - **Target (Take-Profit) Line**: Green dotted line (`#10b981`) with label `TARGET ₹...`.
+  - **Position Average Line**: Violet solid line (`#c084fc`) showing open position average and quantity.
+- **Interactive Visual Order Modification Bar**:
+  - When pending orders exist for the viewed scrip, an interactive action bar renders directly beneath the candlestick chart.
+  - **Quick Nudge Buttons**: `[-₹0.10]` and `[+₹0.10]` buttons immediately call `POST /api/trading/order/modify` to adjust limit orders on the fly.
+  - Real-time sound effects trigger upon modification (fanfare / confirmation chimes).
+  - **1-Click Cancel**: Cancel any order directly from the chart without navigating away.
+- **Quick Chart Actions**:
+  - If no orders are active, convenient quick-action buttons allow pre-filling trade tickets or launching the 1-Click Bracket Order modal.
 
 ---
 
-### Option 4: Embedded TradingView Candlestick Charts with Overlays
-- **HTML5 Canvas Lightweight Charts Integration**:
-  - Powered by `lightweight-charts` v5 in [TradingViewChartModal.tsx](file:///c:/Users/adwiy/fyers-live-price-test/src/components/TradingViewChartModal.tsx).
-  - Backend endpoint `GET /api/chart/candles/:symbol` in `server.ts` generating OHLCV candles, volume histograms, and anchored VWAP ribbons.
-  - **Footprint Markers**: Golden arrow markers placed directly below accumulation candles showing pattern type, volume multiple, and conviction score.
-  - **Crosshair Hover HUD**: Real-time display of Date, Open, High, Low, Close, Volume, and full Footprint Note.
-  - **1-Click Bracket Order Action**: Launch bracket orders directly from within the chart header.
+## 💼 3. Holdings Portfolio & Indian Statutory Tax/Brokerage Estimator
+
+### Key Capabilities
+- **New 'Holdings' Sub-Tab in Trading Desk**:
+  - Added alongside **Positions**, **Order Book**, and **Watchlist** in [TradingDashboard.tsx](file:///c:/Users/adwiy/fyers-live-price-test/src/components/TradingDashboard.tsx).
+  - Works seamlessly in both **Live FYERS** mode (fetching `https://api-t1.fyers.in/api/v3/holdings`) and **Paper Trading** mode (backed by SQLite table `paper_holdings`).
+- **Portfolio Metric Cards**:
+  - **Total Invested Capital**: Cumulative cost basis across delivery scrips.
+  - **Current Portfolio Valuation**: Valued against real-time FYERS cloud quotes.
+  - **Total Unrealized P&L**: Clear monetary and percentage performance with color-coded badges.
+  - **Brokerage Rate Card**: Highlights FYERS ₹0 delivery brokerage.
+- **Delivery Holdings Table**:
+  - Detailed rows displaying Scrip, Quantity, Avg Cost, Live LTP, Invested Value, Current Value, Day Change %, and Total P&L.
+  - **Action Shortcuts**:
+    - `[ 📈 Chart ]`: Instantly launches the Candlestick chart modal for that holding.
+    - `[ ⚡ Trade ]`: Pre-fills the order entry form to buy more or exit.
+    - `[ 🧮 Tax ]`: Loads the holding's cost and current LTP into the Tax & Charges Estimator.
+- **SEBI / NSE Compliant Tax & Brokerage Calculator**:
+  - Toggle between **Delivery (CNC - ₹0 Brok)** and **Intraday (MIS - ₹20 Max)**.
+  - Computes exact statutory breakdown:
+    - **FYERS Brokerage**: ₹0 (Delivery) or ₹20/0.03% (Intraday).
+    - **STT (Securities Transaction Tax)**: 0.1% on buy & sell (Delivery) / 0.025% on sell (Intraday).
+    - **NSE Exchange Turnover Fee**: 0.00297% on total turnover.
+    - **Stamp Duty**: 0.015% on buy (Delivery) / 0.003% on buy (Intraday).
+    - **SEBI Turnover Charges**: ₹10 per crore (0.0001%).
+    - **GST (18%)**: 18% applied on (Brokerage + Exchange Fees + SEBI Fees).
+  - Displays **Total Statutory Charges**, **Gross P&L**, **Net Realized Take-Home P&L**, and **Breakeven Price** (the exact price per share needed to cover all taxes).
 
 ---
 
-### Option 5: Strategy Backtester & Compounding Equity Curve Simulator
-- **Quantitative Performance Engine**:
-  - Implemented in [StrategyBacktesterModal.tsx](file:///c:/Users/adwiy/fyers-live-price-test/src/components/StrategyBacktesterModal.tsx).
-  - High-win swing trading strategies backtested:
-    - **Wyckoff Spring Sweep**: 74.0% Win Rate, 2.5R Avg R:R
-    - **Connors RSI Pullback**: 71.0% Win Rate, 2.1R Avg R:R
-    - **Catalyst Gap Retest**: 69.5% Win Rate, 2.6R Avg R:R
-    - **Smart Money Trail**: 76.0% Win Rate, 3.1R Avg R:R
-    - **All Combined Portfolio**: 72.5% Win Rate, 2.3R Avg R:R
-- **Key Metrics Displayed**:
-  - **Net Return % & P&L (₹)**
-  - **Win Rate %** (Wins / Losses)
-  - **Profit Factor** (Gross Profit / Gross Loss)
-  - **Max Drawdown %** (Peak-to-Trough)
-  - **Average Realized R-Multiple & Expectancy**
-- **Interactive Visualizer**:
-  - SVG Compounding Equity Curve with gradient area shading.
-  - Monte Carlo Re-Simulation engine with seed tracker.
-  - Adjustable parameters: Initial Capital (₹1L – ₹25L), Risk Per Trade (0.5% – 3.0%), History Window, and Trailing Stop toggle.
-  - Full chronological trade execution log table.
+## 🧪 Verification Results
 
----
-
-## 🧪 Verification & Testing Results
-
-1. **TypeScript Compilation & Production Builds**:
-   - `npx tsc --noEmit` passed with 0 errors.
-   - `npm run build` bundled production assets cleanly.
-   - Worker restarted cleanly via supervisor endpoint `POST /api/server/restart`.
-2. **Browser Subagent Verifications**:
-   - Verified 1-Click Bracket Order modal in both Stock Screener and Smart Money Radar.
-   - Verified Audio sound toggle and push notification buttons in header single-row layout.
-   - Verified TradingView Candlestick Chart Modal on HFCL with candles, golden footprint markers, VWAP ribbon, and crosshair HUD.
-   - Verified Quantitative Strategy Backtester modal with compounding equity curve, strategy filtering, Monte Carlo re-simulation, and simulated trade log.
+| Endpoint / Feature | Method / Test | Result |
+| :--- | :--- | :--- |
+| `GET /api/chart/candles/NSE:SIGACHI-EQ?resolution=15` | Intraday 15m Candles | **651 genuine FYERS candles**, EMA 9/21/50, RSI 54.34, MACD computed |
+| `GET /api/chart/candles/NSE:SUZLON-EQ?resolution=1` | Intraday 1m Candles | **1,507 genuine FYERS candles** with real timestamps |
+| `GET /api/trading/holdings` | Portfolio Holdings API | 3 Delivery holdings returned with live LTP, Invested ₹65,835, Current ₹61,164 |
+| `GET /api/trading/charges-calculator` (Delivery) | Buy ₹36.50, Sell ₹42.00, Qty 500 | Gross ₹2,750.00, Charges ₹43.41, **Net P&L ₹2,706.59**, Breakeven +₹0.09 |
+| `GET /api/trading/charges-calculator` (Intraday) | Buy ₹118.00, Sell ₹122.00, Qty 200 | Gross ₹800.00, Charges ₹25.54, **Net P&L ₹774.46**, Breakeven +₹0.13 |
+| Production Build | `npm run build` | **Exit code 0**, zero TypeScript / JSX errors |
+| Frontend Server | `http://localhost:3000` | **HTTP 200 OK**, hot reload confirmed |

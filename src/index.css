@@ -108,6 +108,18 @@
     box-shadow: 0 8px 20px rgba(56, 189, 248, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.7);
   }
 
+  .glossy-btn-sky {
+    background: linear-gradient(180deg, #38bdf8 0%, #0284c7 50%, #0369a1 100%);
+    border-top: 1px solid rgba(255, 255, 255, 0.6);
+    border-bottom: 1px solid rgba(3, 105, 161, 0.8);
+    box-shadow: 0 6px 16px rgba(56, 189, 248, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.5);
+  }
+
+  .glossy-btn-sky:hover:not(:disabled) {
+    background: linear-gradient(180deg, #7dd3fc 0%, #38bdf8 50%, #0284c7 100%);
+    box-shadow: 0 8px 20px rgba(56, 189, 248, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.7);
+  }
+
   .web2-badge {
     background: linear-gradient(180deg, #ffffff 0%, #f0f9ff 100%);
     border: 1px solid #bae6fd;
