@@ -42,7 +42,8 @@ import {
   Volume2,
   VolumeX,
   Bell,
-  BellRing
+  BellRing,
+  Send
 } from 'lucide-react';
 import { soundAlerts, sendDesktopNotification, requestDesktopNotificationPermission } from './utils/audioAlerts';
 import { LogEntry, SymbolSnapshot, CsvRecord } from './types';
@@ -66,6 +67,7 @@ import { StockScreener } from './components/StockScreener';
 import { TradingDashboard } from './components/TradingDashboard';
 import { ServerLogsViewer } from './components/ServerLogsViewer';
 import { SmartMoneyRadar } from './components/SmartMoneyRadar';
+import { TelegramSettingsModal } from './components/TelegramSettingsModal';
 
 export type AppTheme = 'sky' | 'emerald';
 
@@ -123,6 +125,29 @@ export default function App() {
   const [notificationsGranted, setNotificationsGranted] = useState<boolean>(() =>
     typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted'
   );
+
+  // Telegram Integration State
+  const [telegramModalOpen, setTelegramModalOpen] = useState<boolean>(false);
+  const [telegramConnected, setTelegramConnected] = useState<boolean>(false);
+
+  useEffect(() => {
+    let mounted = true;
+    const checkTelegram = async () => {
+      try {
+        const res = await fetch('/api/telegram/status');
+        if (res.ok) {
+          const data = await res.json();
+          if (mounted) setTelegramConnected(Boolean(data.isRunning));
+        }
+      } catch {}
+    };
+    checkTelegram();
+    const interval = setInterval(checkTelegram, 12000);
+    return () => {
+      mounted = false;
+      clearInterval(interval);
+    };
+  }, []);
 
   // Fyers Token Generator Modal States (Dual Tabs: Price Fetch Token & Trading Token)
   const [isTokenModalOpen, setIsTokenModalOpen] = useState<boolean>(false);
@@ -248,6 +273,59 @@ export default function App() {
     } catch {}
   };
 
+  // Market Data Daemon (Background WebSocket Feed) State
+  const [daemonStatus, setDaemonStatus] = useState<{
+    active: boolean;
+    pid: number | null;
+    symbolsCount: number;
+    userDisabled: boolean;
+  }>({
+    active: true,
+    pid: null,
+    symbolsCount: 25,
+    userDisabled: false,
+  });
+  const [daemonLoading, setDaemonLoading] = useState<boolean>(false);
+
+  const fetchDaemonStatus = async () => {
+    try {
+      const res = await fetch('/api/market/daemon/status');
+      if (res.ok) {
+        const data = await res.json();
+        setDaemonStatus({
+          active: Boolean(data.active),
+          pid: data.pid || null,
+          symbolsCount: data.symbolsCount || 0,
+          userDisabled: Boolean(data.userDisabled),
+        });
+      }
+    } catch {}
+  };
+
+  const handleToggleDaemon = async () => {
+    setDaemonLoading(true);
+    try {
+      const target = !daemonStatus.active;
+      const res = await fetch(`/api/market/daemon/toggle?enable=${target}`, { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json();
+        setDaemonStatus({
+          active: Boolean(data.active),
+          pid: data.pid || null,
+          symbolsCount: data.symbolsCount || 0,
+          userDisabled: Boolean(data.userDisabled),
+        });
+        if (data.active) {
+          soundAlerts.playOrderSuccessChime();
+        }
+      }
+    } catch (err) {
+      console.error('Failed to toggle daemon:', err);
+    } finally {
+      setDaemonLoading(false);
+    }
+  };
+
   // Fetch DB stats & auth config periodically
   const fetchAuthConfig = async () => {
     try {
@@ -349,10 +427,12 @@ export default function App() {
     fetchDbStats();
     fetchSqliteStats();
     fetchBackups();
+    fetchDaemonStatus();
     const interval = setInterval(() => {
       fetchDbStats();
       fetchSqliteStats();
       fetchBackups();
+      fetchDaemonStatus();
     }, 8000);
     return () => clearInterval(interval);
   }, []);
@@ -1238,8 +1318,60 @@ export default function App() {
           </button>
         </div>
 
-        {/* Header Right: Audio Chimes, Push Notifications, Token Active Button & Theme Toggle */}
+        {/* Header Right: Background Daemon Toggle, Audio Chimes, Push Notifications, Token Active Button & Theme Toggle */}
         <div className="flex items-center gap-2 sm:gap-2.5 shrink-0 ml-auto xl:ml-0">
+          {/* Background Market Data Daemon Toggle Button */}
+          <button
+            type="button"
+            id="btn-toggle-market-daemon"
+            onClick={handleToggleDaemon}
+            disabled={daemonLoading}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-mono font-bold transition-all cursor-pointer shadow-xs ${
+              daemonStatus.active
+                ? 'bg-emerald-50 text-emerald-800 border border-emerald-300 hover:bg-emerald-100 hover:border-emerald-400 shadow-xs'
+                : 'bg-slate-100 text-slate-500 border border-slate-300 hover:bg-slate-200 hover:text-slate-800'
+            } ${daemonLoading ? 'opacity-50 cursor-wait' : ''}`}
+            title={
+              daemonStatus.active
+                ? `Background Market Feed: ACTIVE (PID ${daemonStatus.pid || 'live'}, ${daemonStatus.symbolsCount} symbols). Click to pause background price fetching.`
+                : 'Background Market Feed: PAUSED. Click to resume background live prices.'
+            }
+          >
+            <span className="relative flex h-2 w-2">
+              {daemonStatus.active && (
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+              )}
+              <span className={`relative inline-flex rounded-full h-2 w-2 ${daemonStatus.active ? 'bg-emerald-500' : 'bg-slate-400'}`}></span>
+            </span>
+            <Radio className={`w-3.5 h-3.5 ${daemonStatus.active ? 'text-emerald-600' : 'text-slate-400'}`} />
+            <span className="text-[11px] whitespace-nowrap">
+              Feed: <span className="font-extrabold">{daemonStatus.active ? 'LIVE' : 'PAUSED'}</span>
+            </span>
+          </button>
+
+          {/* Telegram Bot & Alerts Button */}
+          <button
+            type="button"
+            id="btn-telegram-settings"
+            onClick={() => setTelegramModalOpen(true)}
+            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold transition-all cursor-pointer shadow-xs ${
+              telegramConnected
+                ? 'bg-sky-50 text-sky-800 border border-sky-300 hover:bg-sky-100 hover:border-sky-400'
+                : 'bg-slate-100 text-slate-600 border border-slate-300 hover:bg-slate-200 hover:text-slate-800'
+            }`}
+            title={
+              telegramConnected
+                ? 'Telegram Bot: ONLINE. Click to manage bot settings, test alerts & view commands.'
+                : 'Telegram Bot: DISCONNECTED. Click to configure bot token & chat ID.'
+            }
+          >
+            <Send className={`w-3.5 h-3.5 ${telegramConnected ? 'text-sky-600' : 'text-slate-400'} -rotate-12`} />
+            <span className="text-[11px] font-mono font-bold whitespace-nowrap hidden sm:inline">
+              TG: <span className="font-extrabold">{telegramConnected ? 'ONLINE' : 'SETUP'}</span>
+            </span>
+            <span className={`w-2 h-2 rounded-full ${telegramConnected ? 'bg-emerald-500 animate-pulse' : 'bg-slate-400'}`}></span>
+          </button>
+
           {/* Audio Chimes Toggle */}
           <button
             type="button"
@@ -1401,6 +1533,27 @@ export default function App() {
               >
                 <Square className="w-4 h-4 fill-current drop-shadow-sm" />
                 <span>Stop</span>
+              </button>
+
+              {/* Background Market Feed Toggle in Live Monitor Toolbar */}
+              <button
+                type="button"
+                id="btn-monitor-feed-toggle"
+                onClick={handleToggleDaemon}
+                disabled={daemonLoading}
+                className={`flex-none flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-mono font-bold border transition-all cursor-pointer shadow-xs ${
+                  daemonStatus.active
+                    ? 'bg-emerald-50 text-emerald-800 border-emerald-300 hover:bg-emerald-100'
+                    : 'bg-amber-50 text-amber-850 border-amber-300 hover:bg-amber-100'
+                } ${daemonLoading ? 'opacity-50 cursor-wait' : ''}`}
+                title={
+                  daemonStatus.active
+                    ? `Background WebSocket Market Feed is ON (${daemonStatus.symbolsCount} symbols streaming). Click to pause.`
+                    : 'Background WebSocket Market Feed is PAUSED. Click to resume streaming.'
+                }
+              >
+                <Radio className={`w-3.5 h-3.5 ${daemonStatus.active ? 'text-emerald-600 animate-pulse' : 'text-amber-600'}`} />
+                <span>Background Feed: {daemonStatus.active ? 'ON' : 'PAUSED'}</span>
               </button>
 
               {/* Download Dropdown Button */}
@@ -3476,6 +3629,12 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* Telegram Station & Alerts Settings Modal */}
+      <TelegramSettingsModal
+        isOpen={telegramModalOpen}
+        onClose={() => setTelegramModalOpen(false)}
+      />
 
     </div>
   );

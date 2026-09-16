@@ -1089,7 +1089,7 @@ export const TradingDashboard: React.FC<TradingDashboardProps> = ({
                 <div className="p-3.5 rounded-2xl bg-slate-900 border border-slate-800 shadow-sm flex flex-col">
                   <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Total Invested</span>
                   <span className="text-base sm:text-lg font-black font-mono text-white mt-1">
-                    ₹{holdingsOverall ? holdingsOverall.total_invested.toLocaleString('en-IN', { minimumFractionDigits: 2 }) : '0.00'}
+                    ₹{(holdingsOverall?.total_invested ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                   </span>
                   <span className="text-[10px] text-slate-500 mt-0.5">{holdings.length} Long Delivery Positions</span>
                 </div>
@@ -1097,7 +1097,7 @@ export const TradingDashboard: React.FC<TradingDashboardProps> = ({
                 <div className="p-3.5 rounded-2xl bg-slate-900 border border-slate-800 shadow-sm flex flex-col">
                   <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Current Valuation</span>
                   <span className="text-base sm:text-lg font-black font-mono text-sky-400 mt-1">
-                    ₹{holdingsOverall ? holdingsOverall.total_current.toLocaleString('en-IN', { minimumFractionDigits: 2 }) : '0.00'}
+                    ₹{(holdingsOverall?.total_current ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                   </span>
                   <span className="text-[10px] text-slate-500 mt-0.5">Real-time FYERS LTP</span>
                 </div>
@@ -1106,11 +1106,11 @@ export const TradingDashboard: React.FC<TradingDashboardProps> = ({
                   <span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Total Unrealized P&L</span>
                   <div className="flex items-baseline gap-1 mt-1">
                     <span className={`text-base sm:text-lg font-black font-mono ${(holdingsOverall?.total_pl ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                      {(holdingsOverall?.total_pl ?? 0) >= 0 ? '+' : ''}₹{holdingsOverall ? holdingsOverall.total_pl.toLocaleString('en-IN', { minimumFractionDigits: 2 }) : '0.00'}
+                      {(holdingsOverall?.total_pl ?? 0) >= 0 ? '+' : ''}₹{(holdingsOverall?.total_pl ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                     </span>
                   </div>
                   <span className={`text-[11px] font-bold ${(holdingsOverall?.pnl_percentage ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-                    {(holdingsOverall?.pnl_percentage ?? 0) >= 0 ? '+' : ''}{holdingsOverall?.pnl_percentage.toFixed(2)}% Overall
+                    {(holdingsOverall?.pnl_percentage ?? 0) >= 0 ? '+' : ''}{(holdingsOverall?.pnl_percentage ?? 0).toFixed(2)}% Overall
                   </span>
                 </div>
 
@@ -1160,7 +1160,8 @@ export const TradingDashboard: React.FC<TradingDashboardProps> = ({
                         </tr>
                       ) : (
                         holdings.map((h) => {
-                          const isPos = h.pnl >= 0;
+                          const pnlVal = h.pnl ?? 0;
+                          const isPos = pnlVal >= 0;
                           return (
                             <tr key={h.symbol} className="hover:bg-slate-900/80 transition-colors">
                               <td className="py-3 px-3.5">
@@ -1168,23 +1169,23 @@ export const TradingDashboard: React.FC<TradingDashboardProps> = ({
                                 <div className="text-[10px] text-slate-400">Equity Delivery</div>
                               </td>
                               <td className="py-3 px-3 text-right font-bold text-white">
-                                {h.qty.toLocaleString('en-IN')}
+                                {(h.qty ?? 0).toLocaleString('en-IN')}
                               </td>
                               <td className="py-3 px-3 text-right font-bold text-slate-300">
-                                ₹{h.avg_price.toFixed(2)}
+                                ₹{(h.avg_price ?? 0).toFixed(2)}
                               </td>
                               <td className="py-3 px-3 text-right font-bold text-sky-300">
-                                ₹{h.currentLtp.toFixed(2)}
+                                ₹{(h.currentLtp ?? 0).toFixed(2)}
                               </td>
                               <td className="py-3 px-3 text-right font-bold text-slate-400">
-                                ₹{h.investedValue.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                                ₹{(h.investedValue ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                               </td>
                               <td className="py-3 px-3 text-right font-bold text-slate-200">
-                                ₹{h.currentValue.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
+                                ₹{(h.currentValue ?? 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                               </td>
                               <td className={`py-3 px-3 text-right font-extrabold ${isPos ? 'text-emerald-400' : 'text-rose-400'}`}>
-                                <div>{isPos ? '+' : ''}₹{h.pnl.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</div>
-                                <div className="text-[10px] opacity-80">{isPos ? '+' : ''}{h.pnlPercent.toFixed(2)}%</div>
+                                <div>{isPos ? '+' : ''}₹{pnlVal.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</div>
+                                <div className="text-[10px] opacity-80">{isPos ? '+' : ''}{(h.pnlPercent ?? 0).toFixed(2)}%</div>
                               </td>
                               <td className="py-3 px-3 text-center">
                                 <div className="flex items-center justify-center gap-1.5">

@@ -311,6 +311,14 @@ app.all("/api/*", (req, res) => {
 
   if (req.method === "GET" || req.method === "HEAD") {
     proxyReq.end();
+  } else if ((req as any).body && typeof (req as any).body === "object" && Object.keys((req as any).body).length > 0) {
+    const bodyData = JSON.stringify((req as any).body);
+    proxyReq.setHeader("content-length", Buffer.byteLength(bodyData));
+    proxyReq.setHeader("content-type", "application/json");
+    proxyReq.write(bodyData);
+    proxyReq.end();
+  } else if (req.readableEnded || req.complete) {
+    proxyReq.end();
   } else {
     req.pipe(proxyReq);
   }

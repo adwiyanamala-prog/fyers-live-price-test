@@ -289,7 +289,7 @@ export const TradingViewChartModal: React.FC<TradingViewChartModalProps> = ({
       if (chartData.indicators.ema9?.length > 0) {
         const ema9 = chart.addSeries(LineSeries, {
           color: '#06b6d4',
-          lineWidth: 1.5,
+          lineWidth: 2,
           title: 'EMA 9',
         });
         ema9.setData(chartData.indicators.ema9);
@@ -298,7 +298,7 @@ export const TradingViewChartModal: React.FC<TradingViewChartModalProps> = ({
       if (chartData.indicators.ema21?.length > 0) {
         const ema21 = chart.addSeries(LineSeries, {
           color: '#a855f7',
-          lineWidth: 1.5,
+          lineWidth: 2,
           title: 'EMA 21',
         });
         ema21.setData(chartData.indicators.ema21);
@@ -307,7 +307,7 @@ export const TradingViewChartModal: React.FC<TradingViewChartModalProps> = ({
       if (chartData.indicators.ema50?.length > 0) {
         const ema50 = chart.addSeries(LineSeries, {
           color: '#f97316',
-          lineWidth: 1.5,
+          lineWidth: 2,
           title: 'EMA 50',
         });
         ema50.setData(chartData.indicators.ema50);
@@ -332,7 +332,7 @@ export const TradingViewChartModal: React.FC<TradingViewChartModalProps> = ({
           candlestickSeries.createPriceLine({
             price: ord.stop_loss,
             color: '#ef4444',
-            lineWidth: 1.5,
+            lineWidth: 1,
             lineStyle: LineStyle.Dotted,
             axisLabelVisible: true,
             title: `SL ₹${ord.stop_loss.toFixed(2)}`,
@@ -342,7 +342,7 @@ export const TradingViewChartModal: React.FC<TradingViewChartModalProps> = ({
           candlestickSeries.createPriceLine({
             price: ord.take_profit,
             color: '#10b981',
-            lineWidth: 1.5,
+            lineWidth: 1,
             lineStyle: LineStyle.Dotted,
             axisLabelVisible: true,
             title: `TARGET ₹${ord.take_profit.toFixed(2)}`,

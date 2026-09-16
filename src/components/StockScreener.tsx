@@ -579,7 +579,7 @@ export const StockScreener: React.FC<StockScreenerProps> = ({
             <Zap className="w-4 h-4 fill-current" />
             <span>Swing Strategies Hub</span>
             <span className="px-1.5 py-0.5 rounded-full text-[10px] font-mono bg-slate-950 text-amber-300 border border-amber-400/40">
-              {Array.from(strategyMatchesMap.values()).reduce((acc, l) => acc + l.length, 0)} Setups
+              {Array.from(strategyMatchesMap.values()).reduce((acc: number, l: any) => acc + (l?.length || 0), 0)} Setups
             </span>
           </button>
 

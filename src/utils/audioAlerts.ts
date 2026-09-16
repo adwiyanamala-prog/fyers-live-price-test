@@ -218,6 +218,54 @@ class SoundAlertEngine {
       console.warn('Audio alert error:', e);
     }
   }
+
+  public playDoubleLowConfirm() {
+    this.playOrderSuccessChime();
+  }
+
+  public playOrderFilledFanfare() {
+    this.playOrderSuccessChime();
+  }
+
+  public playRejectionBuzzer() {
+    if (!this.soundEnabled) return;
+    const ctx = this.initCtx();
+    if (!ctx) return;
+    try {
+      const now = ctx.currentTime;
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(150, now);
+      gain.gain.setValueAtTime(0.2, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.3);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + 0.3);
+    } catch {}
+  }
+
+  public playDoubleNeutralBeep() {
+    if (!this.soundEnabled) return;
+    const ctx = this.initCtx();
+    if (!ctx) return;
+    try {
+      const now = ctx.currentTime;
+      [440, 440].forEach((freq, idx) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(freq, now + idx * 0.1);
+        gain.gain.setValueAtTime(0.15, now + idx * 0.1);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + idx * 0.1 + 0.08);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(now + idx * 0.1);
+        osc.stop(now + idx * 0.1 + 0.08);
+      });
+    } catch {}
+  }
 }
 
 export const soundAlerts = new SoundAlertEngine();

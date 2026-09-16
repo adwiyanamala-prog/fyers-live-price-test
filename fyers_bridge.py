@@ -9,6 +9,7 @@ import sys
 import json
 import time
 import signal
+import threading
 from datetime import datetime, timezone, timedelta
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -58,6 +59,7 @@ except ImportError:
 # Globals
 fyers_socket = None
 is_running = True
+subscribed_symbols = set(symbols)
 
 
 def emit_event(event_type, data):
@@ -199,18 +201,50 @@ def on_close(message):
 
 def on_open():
     """Handle successful connection."""
-    global reconnect_delay, last_activity_time
+    global reconnect_delay, last_activity_time, subscribed_symbols
     reconnect_delay = MIN_RECONNECT_DELAY
     last_activity_time = time.time()
     emit_event("status", {"message": "Connected successfully to FYERS WebSocket."})
-    emit_event("status", {"message": f"Subscribing to symbols: {', '.join(symbols)}..."})
+    sym_list = list(subscribed_symbols)
+    emit_event("status", {"message": f"Subscribing to {len(sym_list)} symbols: {', '.join(sym_list[:8])}..."})
     try:
         if fyers_socket:
-            fyers_socket.subscribe(symbols=symbols, data_type="SymbolUpdate")
+            fyers_socket.subscribe(symbols=sym_list, data_type="SymbolUpdate")
             emit_event("status", {"message": "Subscription successful."})
             emit_event("status", {"message": "Waiting for market data...\n"})
     except Exception as e:
         emit_event("error", {"message": f"Subscription failed: {e}"})
+
+
+def listen_stdin():
+    """Dynamically receive subscription commands from Node.js stdin."""
+    global fyers_socket, subscribed_symbols, is_running
+    while is_running:
+        try:
+            line = sys.stdin.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            data = json.loads(line)
+            if data.get("action") == "subscribe" and data.get("symbols"):
+                new_symbols = [s.strip() for s in data["symbols"] if s.strip() and s.strip() not in subscribed_symbols]
+                if new_symbols:
+                    for s in new_symbols:
+                        subscribed_symbols.add(s)
+                    if fyers_socket:
+                        try:
+                            fyers_socket.subscribe(symbols=new_symbols, data_type="SymbolUpdate")
+                            emit_event("status", {"message": f"Subscribed to {len(new_symbols)} additional symbols: {', '.join(new_symbols[:5])}"})
+                        except Exception as sub_err:
+                            emit_event("error", {"message": f"Dynamic subscribe error: {sub_err}"})
+        except Exception:
+            pass
+
+
+stdin_thread = threading.Thread(target=listen_stdin, daemon=True)
+stdin_thread.start()
 
 
 def handle_exit(signum, frame):

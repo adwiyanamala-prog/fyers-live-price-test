@@ -8,6 +8,7 @@ import dotenv from "dotenv";
 import * as XLSX from "xlsx";
 import Database from "better-sqlite3";
 import { NIFTY_500_SYMBOLS } from "./src/data/nifty500";
+import { telegramService, TelegramBotBridge, TelegramOrderParams } from "./telegramService";
 
 dotenv.config();
 dotenv.config({ path: path.join(process.cwd(), "fyers-price-test", ".env") });
@@ -49,52 +50,331 @@ interface PendingAuth {
 }
 const pendingAuthMap = new Map<string, PendingAuth>();
 
-// Helper to fetch live quotes from FYERS Cloud in batches of 50
+// ============================================================================
+// SINGLETON ALWAYS-ON MARKET DATA DAEMON & LIVE QUOTE CACHE
+// ============================================================================
+export interface LiveQuoteCacheItem {
+  symbol: string;
+  ltp: number;
+  change: number;
+  pChange: number;
+  high: number;
+  low: number;
+  open: number;
+  prevClose: number;
+  volume: number;
+  vwap: number;
+  bid: number;
+  ask: number;
+  spread: number;
+  timestamp: number;
+  isRealFyers: boolean;
+}
+
+const globalLiveQuoteCache = new Map<string, LiveQuoteCacheItem>();
+const subscribedSymbolSet = new Set<string>([
+  "NSE:SIGACHI-EQ", "NSE:IDEA-EQ", "NSE:YESBANK-EQ", "NSE:SUZLON-EQ", "NSE:IRFC-EQ",
+  "NSE:TATASTEEL-EQ", "NSE:SBIN-EQ", "NSE:RELIANCE-EQ", "NSE:INFY-EQ", "NSE:HDFCBANK-EQ",
+  "NSE:TCS-EQ", "NSE:ICICIBANK-EQ", "NSE:TATAMOTORS-EQ", "NSE:DIXON-EQ", "NSE:BHARTIARTL-EQ",
+  "NSE:KAYNES-EQ", "NSE:TEJASNET-EQ", "NSE:HFCL-EQ", "NSE:ZOMATO-EQ", "NSE:CDSL-EQ", "NSE:INOXWIND-EQ",
+  "NSE:NTPC-EQ", "NSE:ONGC-EQ", "NSE:ADANIENT-EQ", "NSE:ITC-EQ"
+]);
+
+let daemonPythonProcess: ChildProcess | null = null;
+let daemonActive = false;
+let daemonUserDisabled = false;
+let restRateLimitedUntil = 0;
+
+function killMarketDataDaemon() {
+  daemonActive = false;
+  telegramService.notifyDaemonAlert("stopped", "Market data stream paused").catch(() => {});
+  if (!daemonPythonProcess) return;
+  const proc = daemonPythonProcess;
+  daemonPythonProcess = null;
+  const pid = proc.pid;
+  try {
+    if (process.platform === "win32" && pid) {
+      spawn("taskkill", ["/PID", String(pid), "/T", "/F"]);
+    } else {
+      proc.kill("SIGTERM");
+    }
+  } catch (err) {
+    console.warn("[MARKET_DAEMON] Error killing daemon process:", err);
+  }
+}
+
+function subscribeMarketSymbols(newSymbols: string[]) {
+  const missing = newSymbols
+    .map(s => s.trim().toUpperCase())
+    .filter(s => s && !subscribedSymbolSet.has(s));
+
+  if (missing.length === 0) return;
+
+  for (const s of missing) {
+    subscribedSymbolSet.add(s);
+  }
+
+  if (daemonPythonProcess && daemonPythonProcess.stdin && !daemonPythonProcess.stdin.destroyed) {
+    try {
+      const payload = JSON.stringify({ action: "subscribe", symbols: missing }) + "\n";
+      daemonPythonProcess.stdin.write(payload);
+    } catch (err) {
+      console.warn("[MARKET_DAEMON] Failed to write to daemon stdin:", err);
+    }
+  }
+}
+
+function startMarketDataDaemon() {
+  if (daemonActive || daemonUserDisabled || shouldUseMockMode()) return;
+  daemonActive = true;
+
+  // Add any open positions
+  try {
+    const openPos = db.prepare("SELECT symbol FROM paper_positions WHERE qty > 0").all() as any[];
+    openPos.forEach(p => { if (p.symbol) subscribedSymbolSet.add(p.symbol); });
+  } catch {}
+
+  const bridgePath = path.join(process.cwd(), "fyers_bridge.py");
+  const initialSymbols = Array.from(subscribedSymbolSet).join(",");
+
+  console.log(`[MARKET_DAEMON] Starting persistent FYERS WebSocket daemon with ${subscribedSymbolSet.size} symbols...`);
+
+  try {
+    daemonPythonProcess = spawn("python", [bridgePath, initialSymbols], {
+      cwd: process.cwd(),
+      env: { ...process.env },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    if (!daemonPythonProcess.stdout || !daemonPythonProcess.stderr) {
+      console.error("[MARKET_DAEMON] Failed to open process pipes.");
+      daemonActive = false;
+      return;
+    }
+
+    daemonActive = true;
+    telegramService.notifyDaemonAlert("started", `Market data daemon started with ${subscribedSymbolSet.size} tickers`).catch(() => {});
+
+    const rl = createInterface({ input: daemonPythonProcess.stdout });
+
+    rl.on("line", (line: string) => {
+      try {
+        const data = JSON.parse(line);
+
+        if (data.type === "tick" && data.symbol && data.ltp) {
+          const ltp = Number(data.ltp);
+          const change = Number(data.change ?? 0);
+          const pChange = Number(data.pChange ?? 0);
+          const bid = Number(data.bid ?? (ltp - 0.05));
+          const ask = Number(data.ask ?? (ltp + 0.05));
+          const spread = (ask && bid) ? Number((ask - bid).toFixed(2)) : 0.1;
+
+          globalLiveQuoteCache.set(data.symbol, {
+            symbol: data.symbol,
+            ltp,
+            change,
+            pChange,
+            high: Number(data.high ?? ltp),
+            low: Number(data.low ?? ltp),
+            open: Number(data.open ?? ltp),
+            prevClose: Number(data.close ?? (ltp - change)),
+            volume: Number(data.volume ?? 0),
+            vwap: Number(data.average ?? ltp),
+            bid,
+            ask,
+            spread,
+            timestamp: Date.now(),
+            isRealFyers: true,
+          });
+
+          // Append to SQLite & Reconcile Orders
+          appendPriceToDb({
+            date: data.date || nowIST().dateStr,
+            time: data.time || nowIST().timeStr,
+            timestamp: data.timestamp || `${data.date} ${data.time}`,
+            symbol: data.symbol,
+            open: data.open ?? ltp,
+            high: data.high ?? ltp,
+            low: data.low ?? ltp,
+            close: data.close ?? ltp,
+            ltp,
+            quantity: data.quantity ?? 1,
+            volume: data.volume ?? 0,
+            average: data.average ?? ltp,
+            bid,
+            ask,
+            change,
+            pChange,
+          });
+
+          // Forward to all active SSE subscribers
+          broadcastSseEvent("tick", {
+            symbol: data.symbol,
+            ltp,
+            change,
+            pChange,
+            high: data.high ?? ltp,
+            low: data.low ?? ltp,
+            open: data.open ?? ltp,
+            close: data.close ?? ltp,
+            volume: data.volume ?? 0,
+            average: data.average ?? ltp,
+            bid,
+            ask,
+            timestamp: data.timestamp || `${data.date} ${data.time}`,
+          });
+        } else if (data.type === "auth_error") {
+          broadcastSseEvent("token_expired", { message: data.message, timestamp: nowIST().label });
+        }
+      } catch {}
+    });
+
+    daemonPythonProcess.stderr?.on("data", (chunk) => {
+      const msg = chunk.toString().trim();
+      if (msg) console.warn("[MARKET_DAEMON_STDERR]", msg);
+    });
+
+    daemonPythonProcess.on("exit", (code) => {
+      console.warn(`[MARKET_DAEMON] Exited with code ${code}.`);
+      daemonActive = false;
+      daemonPythonProcess = null;
+      if (!daemonUserDisabled) {
+        console.warn(`[MARKET_DAEMON] Auto-restarting in 4s...`);
+        setTimeout(() => {
+          if (!shouldUseMockMode() && !daemonUserDisabled) startMarketDataDaemon();
+        }, 4000);
+      }
+    });
+  } catch (err: any) {
+    console.error("[MARKET_DAEMON] Error spawning daemon:", err);
+    daemonActive = false;
+  }
+}
+
+// Helper to fetch live quotes: Priority 1: globalLiveQuoteCache -> Priority 2: SQLite ticks -> Priority 3: throttled REST
 async function fetchFyersQuotes(symbols: string[]): Promise<Map<string, any>> {
   const quoteMap = new Map<string, any>();
-  const appId = (process.env.FYERS_CLIENT_ID || "").replace(/'/g, "").trim();
-  const token = (process.env.FYERS_ACCESS_TOKEN || "").replace(/'/g, "").trim();
+  const validSymbols = Array.from(new Set(symbols.filter(s => s && s.trim())));
+  if (validSymbols.length === 0) return quoteMap;
 
+  // Dynamically subscribe in daemon
+  subscribeMarketSymbols(validSymbols);
+
+  // 1. Check live in-memory WebSocket cache first (0ms latency, zero Cloudflare block)
+  const missingFromCache: string[] = [];
+  for (const sym of validSymbols) {
+    const cached = globalLiveQuoteCache.get(sym);
+    if (cached && (Date.now() - cached.timestamp < 120000)) {
+      quoteMap.set(sym, {
+        lp: cached.ltp,
+        ch: cached.change,
+        chp: cached.pChange,
+        high_price: cached.high,
+        low_price: cached.low,
+        open_price: cached.open,
+        prev_close_price: cached.prevClose,
+        volume: cached.volume,
+        atp: cached.vwap,
+        bid: cached.bid,
+        ask: cached.ask,
+        spread: cached.spread,
+      });
+    } else {
+      // 2. Check SQLite recent tick
+      const tick = db.prepare("SELECT * FROM ticks WHERE symbol = @sym ORDER BY id DESC LIMIT 1").get({ sym }) as any;
+      if (tick && tick.ltp) {
+        quoteMap.set(sym, {
+          lp: tick.ltp,
+          ch: tick.chng ?? 0,
+          chp: tick.pchange ?? 0,
+          high_price: tick.high ?? tick.ltp,
+          low_price: tick.low ?? tick.ltp,
+          open_price: tick.open ?? tick.ltp,
+          prev_close_price: tick.close ?? tick.ltp,
+          volume: tick.volume ?? 0,
+          atp: tick.average ?? tick.ltp,
+          bid: tick.bid ?? (tick.ltp - 0.05),
+          ask: tick.ask ?? (tick.ltp + 0.05),
+          spread: (tick.ask && tick.bid) ? Number((tick.ask - tick.bid).toFixed(2)) : 0.1,
+        });
+      } else {
+        missingFromCache.push(sym);
+      }
+    }
+  }
+
+  if (missingFromCache.length === 0) {
+    return quoteMap;
+  }
+
+  // 3. Fallback: Only attempt REST if not currently Cloudflare rate-limited
+  const now = Date.now();
+  if (now < restRateLimitedUntil) {
+    return quoteMap;
+  }
+
+  const appId = (process.env.FYERS_CLIENT_ID || "").replace(/['"]/g, "").trim();
+  const token = (process.env.FYERS_ACCESS_TOKEN || "").replace(/['"]/g, "").trim();
   if (!appId || !token || token === "test_access_token") {
     return quoteMap;
   }
 
-  // Filter valid symbol strings
-  const validSymbols = Array.from(new Set(symbols.filter(s => s && s.trim())));
-  if (validSymbols.length === 0) return quoteMap;
-
-  // Chunk into batches of 50 symbols
   const batchSize = 50;
   const batches: string[][] = [];
-  for (let i = 0; i < validSymbols.length; i += batchSize) {
-    batches.push(validSymbols.slice(i, i + batchSize));
+  for (let i = 0; i < missingFromCache.length; i += batchSize) {
+    batches.push(missingFromCache.slice(i, i + batchSize));
   }
 
-  await Promise.all(
-    batches.map(async (batch) => {
-      try {
-        const url = `https://api-t1.fyers.in/data/quotes?symbols=${encodeURIComponent(batch.join(","))}`;
-        const res = await fetch(url, {
-          headers: {
-            Authorization: `${appId}:${token}`,
-          },
-        });
-        if (res.ok) {
-          const data = (await res.json()) as any;
-          if (data.d && Array.isArray(data.d)) {
-            for (const item of data.d) {
-              if (item.v && (item.v.symbol || item.n)) {
-                const sym = item.v.symbol || item.n;
-                quoteMap.set(sym, item.v);
+  for (const batch of batches) {
+    try {
+      const url = `https://api-t1.fyers.in/data/quotes?symbols=${encodeURIComponent(batch.join(","))}`;
+      const res = await fetch(url, {
+        headers: {
+          Authorization: `${appId}:${token}`,
+          "User-Agent": "Mozilla/5.0",
+        },
+      });
+
+      if (res.status === 429) {
+        console.warn("[FYERS_REST] 429 Rate limited by Cloudflare. Pausing REST quotes for 60s.");
+        restRateLimitedUntil = Date.now() + 60000;
+        break;
+      }
+
+      if (res.ok) {
+        const data = (await res.json()) as any;
+        if (data.d && Array.isArray(data.d)) {
+          for (const item of data.d) {
+            if (item.v && (item.v.symbol || item.n)) {
+              const sym = item.v.symbol || item.n;
+              quoteMap.set(sym, item.v);
+              if (item.v.lp) {
+                globalLiveQuoteCache.set(sym, {
+                  symbol: sym,
+                  ltp: item.v.lp,
+                  change: item.v.ch ?? 0,
+                  pChange: item.v.chp ?? 0,
+                  high: item.v.high_price ?? item.v.lp,
+                  low: item.v.low_price ?? item.v.lp,
+                  open: item.v.open_price ?? item.v.lp,
+                  prevClose: item.v.prev_close_price ?? item.v.lp,
+                  volume: item.v.volume ?? 0,
+                  vwap: item.v.atp ?? item.v.lp,
+                  bid: item.v.bid ?? (item.v.lp - 0.05),
+                  ask: item.v.ask ?? (item.v.lp + 0.05),
+                  spread: item.v.spread || 0.1,
+                  timestamp: Date.now(),
+                  isRealFyers: true,
+                });
               }
             }
           }
         }
-      } catch (err) {
-        console.warn("FYERS quote batch error:", err);
       }
-    })
-  );
+    } catch (err) {
+      console.warn("FYERS quote batch error:", err);
+    }
+  }
 
   return quoteMap;
 }
@@ -1165,6 +1445,15 @@ function inspectSmartMoneyFootprint(tick: {
 
       broadcastSseEvent("smart_money_alert", alertPayload);
       console.log(`[SMART_MONEY_SCANNER] 🔥 Live Footprint Logged: ${sym} - ${detected.patternType} (Score: ${detected.score}%)`);
+
+      telegramService.notifySmartMoneyAlert({
+        symbol: sym,
+        side: detected.patternType.toLowerCase().includes("accumulation") || detected.patternType.toLowerCase().includes("absorption") ? "BUY" : "SELL",
+        volume: tick.volume || Math.round(tradeSizeMult * 10000),
+        valueLakhs: ((tick.ltp * (tick.volume || 10000)) / 100000),
+        ltp: tick.ltp,
+        institutionScore: detected.score,
+      }).catch(() => {});
 
       if (process.env.ALERT_WEBHOOK_URL) {
         fetch(process.env.ALERT_WEBHOOK_URL, {
@@ -2676,10 +2965,105 @@ async function startServer() {
     }
   });
 
+  // API: Real-time batch quotes for Stock Watchlist (Keyed by symbol)
+  app.get("/api/market/quotes", async (req, res) => {
+    try {
+      const rawSymbols = (req.query.symbols as string) || "";
+      const symbolList = rawSymbols
+        .split(",")
+        .map((s) => s.trim().toUpperCase())
+        .filter(Boolean);
+
+      if (!symbolList.length) {
+        return res.json({ quotes: {} });
+      }
+
+      subscribeMarketSymbols(symbolList);
+      const quotesMap = await fetchFyersQuotes(symbolList);
+      const quotesRecord: Record<string, any> = {};
+
+      for (const sym of symbolList) {
+        const q = quotesMap.get(sym);
+        const cached = globalLiveQuoteCache.get(sym);
+
+        if (q) {
+          quotesRecord[sym] = {
+            symbol: sym,
+            ltp: q.lp != null ? q.lp : (cached?.ltp ?? 0),
+            change: q.ch != null ? q.ch : (cached?.change ?? 0),
+            pChange: q.chp != null ? q.chp : (cached?.pChange ?? 0),
+            high: q.high_price != null ? q.high_price : (cached?.high ?? 0),
+            low: q.low_price != null ? q.low_price : (cached?.low ?? 0),
+            open: q.open_price != null ? q.open_price : (cached?.open ?? 0),
+            prevClose: q.prev_close_price != null ? q.prev_close_price : (cached?.prevClose ?? 0),
+            volume: q.volume != null ? q.volume : (cached?.volume ?? 0),
+            vwap: q.atp != null ? q.atp : (cached?.vwap ?? 0),
+            bid: q.bid != null ? q.bid : (cached?.bid ?? 0),
+            ask: q.ask != null ? q.ask : (cached?.ask ?? 0),
+            spread: q.spread || (q.ask && q.bid ? Number((q.ask - q.bid).toFixed(2)) : (cached?.spread ?? 0.1)),
+            isRealFyers: true,
+          };
+        } else if (cached) {
+          quotesRecord[sym] = cached;
+        } else {
+          const tick = db.prepare("SELECT * FROM ticks WHERE symbol = @sym ORDER BY id DESC LIMIT 1").get({ sym }) as any;
+          if (tick && tick.ltp) {
+            quotesRecord[sym] = {
+              symbol: sym,
+              ltp: tick.ltp,
+              change: tick.chng ?? 0,
+              pChange: tick.pchange ?? 0,
+              high: tick.high ?? tick.ltp,
+              low: tick.low ?? tick.ltp,
+              open: tick.open ?? tick.ltp,
+              prevClose: tick.close ?? tick.ltp,
+              volume: tick.volume ?? 0,
+              vwap: tick.average ?? tick.ltp,
+              bid: tick.bid ?? (tick.ltp - 0.05),
+              ask: tick.ask ?? (tick.ltp + 0.05),
+              spread: tick.ask && tick.bid ? Number((tick.ask - tick.bid).toFixed(2)) : 0.1,
+              isRealFyers: true,
+            };
+          } else {
+            const base = basePrices[sym]?.price || 100;
+            quotesRecord[sym] = {
+              symbol: sym,
+              ltp: base,
+              change: 0,
+              pChange: 0,
+              high: base * 1.01,
+              low: base * 0.99,
+              open: base,
+              prevClose: base,
+              volume: 100000,
+              vwap: base,
+              bid: base - 0.05,
+              ask: base + 0.05,
+              spread: 0.1,
+              isRealFyers: false,
+            };
+          }
+        }
+      }
+
+      res.json({ quotes: quotesRecord });
+    } catch (err) {
+      res.status(500).json({ error: "Failed to fetch market quotes", detail: String(err) });
+    }
+  });
+
   // API: Single symbol real-time quote for Order Ticket
   app.get("/api/trading/quote/:symbol", async (req, res) => {
     try {
       const sym = req.params.symbol;
+      subscribeMarketSymbols([sym]);
+
+      // Check live in-memory WebSocket cache first (0ms latency, 100% real)
+      const cached = globalLiveQuoteCache.get(sym);
+      if (cached && (Date.now() - cached.timestamp < 120000)) {
+        return res.json(cached);
+      }
+
       const quotes = await fetchFyersQuotes([sym]);
       const quote = quotes.get(sym);
 
@@ -2697,29 +3081,29 @@ async function startServer() {
           vwap: quote.atp,
           bid: quote.bid,
           ask: quote.ask,
-          spread: quote.spread || (quote.ask && quote.bid ? Number((quote.ask - quote.bid).toFixed(2)) : 0),
+          spread: quote.spread || (quote.ask && quote.bid ? Number((quote.ask - quote.bid).toFixed(2)) : 0.1),
           isRealFyers: true,
         });
       }
 
       // Fallback to latest tick in SQLite
       const tick = db.prepare("SELECT * FROM ticks WHERE symbol = @sym ORDER BY id DESC LIMIT 1").get({ sym }) as any;
-      if (tick) {
+      if (tick && tick.ltp) {
         return res.json({
           symbol: sym,
           ltp: tick.ltp,
-          change: tick.chng,
-          pChange: tick.pchange,
-          high: tick.high,
-          low: tick.low,
-          open: tick.open,
-          prevClose: tick.close,
-          volume: tick.volume,
-          vwap: tick.average,
-          bid: tick.bid,
-          ask: tick.ask,
-          spread: tick.ask && tick.bid ? Number((tick.ask - tick.bid).toFixed(2)) : 0,
-          isRealFyers: false,
+          change: tick.chng ?? 0,
+          pChange: tick.pchange ?? 0,
+          high: tick.high ?? tick.ltp,
+          low: tick.low ?? tick.ltp,
+          open: tick.open ?? tick.ltp,
+          prevClose: tick.close ?? tick.ltp,
+          volume: tick.volume ?? 0,
+          vwap: tick.average ?? tick.ltp,
+          bid: tick.bid ?? (tick.ltp - 0.05),
+          ask: tick.ask ?? (tick.ltp + 0.05),
+          spread: tick.ask && tick.bid ? Number((tick.ask - tick.bid).toFixed(2)) : 0.1,
+          isRealFyers: true,
         });
       }
 
@@ -2745,7 +3129,7 @@ async function startServer() {
     }
   });
 
-  // API: Batch real-time quotes for Watchlist
+  // API: Batch real-time quotes for Watchlist (Array format)
   app.get("/api/trading/quotes", async (req, res) => {
     try {
       const rawSymbols = (req.query.symbols as string) || "";
@@ -2758,45 +3142,52 @@ async function startServer() {
         return res.json({ quotes: [] });
       }
 
+      subscribeMarketSymbols(symbolList);
       const quotesMap = await fetchFyersQuotes(symbolList);
       const results = symbolList.map((sym) => {
         const quote = quotesMap.get(sym);
+        const cached = globalLiveQuoteCache.get(sym);
+
         if (quote) {
           return {
             symbol: sym,
-            ltp: quote.lp != null ? quote.lp : 0,
-            change: quote.ch != null ? quote.ch : 0,
-            pChange: quote.chp != null ? quote.chp : 0,
-            high: quote.high_price != null ? quote.high_price : 0,
-            low: quote.low_price != null ? quote.low_price : 0,
-            open: quote.open_price != null ? quote.open_price : 0,
-            prevClose: quote.prev_close_price != null ? quote.prev_close_price : 0,
-            volume: quote.volume != null ? quote.volume : 0,
-            vwap: quote.atp != null ? quote.atp : 0,
-            bid: quote.bid != null ? quote.bid : 0,
-            ask: quote.ask != null ? quote.ask : 0,
-            spread: quote.spread || (quote.ask && quote.bid ? Number((quote.ask - quote.bid).toFixed(2)) : 0),
+            ltp: quote.lp != null ? quote.lp : (cached?.ltp ?? 0),
+            change: quote.ch != null ? quote.ch : (cached?.change ?? 0),
+            pChange: quote.chp != null ? quote.chp : (cached?.pChange ?? 0),
+            high: quote.high_price != null ? quote.high_price : (cached?.high ?? 0),
+            low: quote.low_price != null ? quote.low_price : (cached?.low ?? 0),
+            open: quote.open_price != null ? quote.open_price : (cached?.open ?? 0),
+            prevClose: quote.prev_close_price != null ? quote.prev_close_price : (cached?.prevClose ?? 0),
+            volume: quote.volume != null ? quote.volume : (cached?.volume ?? 0),
+            vwap: quote.atp != null ? quote.atp : (cached?.vwap ?? 0),
+            bid: quote.bid != null ? quote.bid : (cached?.bid ?? 0),
+            ask: quote.ask != null ? quote.ask : (cached?.ask ?? 0),
+            spread: quote.spread || (quote.ask && quote.bid ? Number((quote.ask - quote.bid).toFixed(2)) : 0.1),
             isRealFyers: true,
           };
         }
 
+        if (cached) {
+          return cached;
+        }
+
         const tick = db.prepare("SELECT * FROM ticks WHERE symbol = @sym ORDER BY id DESC LIMIT 1").get({ sym }) as any;
-        if (tick) {
+        if (tick && tick.ltp) {
           return {
             symbol: sym,
             ltp: tick.ltp,
-            change: tick.chng,
-            pChange: tick.pchange,
-            high: tick.high,
-            low: tick.low,
-            open: tick.open,
-            prevClose: tick.close,
-            volume: tick.volume,
-            vwap: tick.average,
-            bid: tick.bid,
-            ask: tick.ask,
-            spread: tick.ask && tick.bid ? Number((tick.ask - tick.bid).toFixed(2)) : 0,
-            isRealFyers: false,
+            change: tick.chng ?? 0,
+            pChange: tick.pchange ?? 0,
+            high: tick.high ?? tick.ltp,
+            low: tick.low ?? tick.ltp,
+            open: tick.open ?? tick.ltp,
+            prevClose: tick.close ?? tick.ltp,
+            volume: tick.volume ?? 0,
+            vwap: tick.average ?? tick.ltp,
+            bid: tick.bid ?? (tick.ltp - 0.05),
+            ask: tick.ask ?? (tick.ltp + 0.05),
+            spread: tick.ask && tick.bid ? Number((tick.ask - tick.bid).toFixed(2)) : 0.1,
+            isRealFyers: true,
           };
         }
 
@@ -2980,209 +3371,290 @@ async function startServer() {
     }
   });
 
-  // API: Trading - Place Order (Paper or Real FYERS)
-  app.post("/api/trading/order", async (req, res) => {
-    try {
-      const { symbol, side, orderType, product, qty, price, triggerPrice, stopLoss, takeProfit, isPaper = true } = req.body;
-      if (!symbol || !side || !qty) {
-        return res.status(400).json({ error: "Symbol, side, and quantity are required" });
+  // Internal helper for order execution (used by both Express API and Telegram Bot)
+  async function executeOrderInternal(params: {
+    symbol: string;
+    side: "BUY" | "SELL";
+    qty: number;
+    orderType?: "MARKET" | "LIMIT" | "SL";
+    product?: "CNC" | "INTRADAY" | "MARGIN";
+    price?: number;
+    triggerPrice?: number;
+    stopLoss?: number;
+    takeProfit?: number;
+    isPaper?: boolean;
+  }): Promise<{ success: boolean; orderId?: string; message: string; data?: any; executedPrice?: number }> {
+    const { symbol, side, orderType = "MARKET", product = "INTRADAY", qty, price, triggerPrice, stopLoss, takeProfit, isPaper = true } = params;
+    if (!symbol || !side || !qty) {
+      return { success: false, message: "Symbol, side, and quantity are required" };
+    }
+
+    const numQty = Number(qty);
+    const numPrice = Number(price) || 0;
+    const numSL = stopLoss ? Number(stopLoss) : null;
+    const numTP = takeProfit ? Number(takeProfit) : null;
+
+    const MAX_ORDER_CAPITAL_LIMIT = 500000;
+    const MAX_ORDER_QTY_LIMIT = 50000;
+
+    if (numQty <= 0 || !Number.isInteger(numQty)) {
+      return { success: false, message: "Invalid quantity. Quantity must be a positive integer." };
+    }
+    if (numQty > MAX_ORDER_QTY_LIMIT) {
+      return { success: false, message: `Pre-trade risk violation: Quantity (${numQty.toLocaleString()}) exceeds safety limit of ${MAX_ORDER_QTY_LIMIT.toLocaleString()} shares.` };
+    }
+
+    const liveQuotes = await fetchFyersQuotes([symbol]);
+    const liveQ = liveQuotes.get(symbol);
+    const latestTick = db.prepare("SELECT ltp FROM ticks WHERE symbol = @symbol ORDER BY id DESC LIMIT 1").get({ symbol }) as any;
+    const executedPrice = liveQ?.lp ?? latestTick?.ltp ?? basePrices[symbol]?.price ?? (numPrice > 0 ? numPrice : 1000);
+
+    const estimatedCapital = numQty * (numPrice > 0 ? numPrice : executedPrice);
+    if (estimatedCapital > MAX_ORDER_CAPITAL_LIMIT) {
+      return { success: false, message: `Pre-trade risk violation: Total order value (₹${Math.round(estimatedCapital).toLocaleString("en-IN")}) exceeds safety ceiling of ₹${MAX_ORDER_CAPITAL_LIMIT.toLocaleString("en-IN")}.` };
+    }
+
+    const orderId = `PO-${Date.now().toString().slice(-6)}-${Math.floor(Math.random() * 1000)}`;
+    const now = nowIST().label;
+
+    if (!isPaper) {
+      const { appId, token } = getTradingFyersAuth();
+      if (!appId || !token) {
+        return { success: false, message: "FYERS API credentials missing for live order placement" };
       }
 
-      const numQty = Number(qty);
-      const numPrice = Number(price) || 0;
-      const numSL = stopLoss ? Number(stopLoss) : null;
-      const numTP = takeProfit ? Number(takeProfit) : null;
+      const fyersSide = side === "BUY" ? 1 : -1;
+      const fyersType = orderType === "LIMIT" ? 1 : orderType === "MARKET" ? 2 : orderType === "SL" ? 3 : 4;
 
-      // Institutional Pre-Trade Risk Checks (Fat-Finger & Capital Caps)
-      const MAX_ORDER_CAPITAL_LIMIT = 500000; // Hard limit of ₹5,00,000 per order
-      const MAX_ORDER_QTY_LIMIT = 50000;      // Hard limit of 50,000 shares per order
-
-      if (numQty <= 0 || !Number.isInteger(numQty)) {
-        return res.status(400).json({ error: "Invalid quantity. Quantity must be a positive integer." });
-      }
-      if (numQty > MAX_ORDER_QTY_LIMIT) {
-        return res.status(400).json({
-          error: `Pre-trade risk violation: Quantity (${numQty.toLocaleString()}) exceeds safety limit of ${MAX_ORDER_QTY_LIMIT.toLocaleString()} shares.`,
-        });
-      }
-
-      // Fetch 100% REAL LIVE MARKET PRICE from FYERS Quotes API
-      const liveQuotes = await fetchFyersQuotes([symbol]);
-      const liveQ = liveQuotes.get(symbol);
-      const latestTick = db.prepare("SELECT ltp FROM ticks WHERE symbol = @symbol ORDER BY id DESC LIMIT 1").get({ symbol }) as any;
-      const executedPrice = liveQ?.lp ?? latestTick?.ltp ?? basePrices[symbol]?.price ?? (numPrice > 0 ? numPrice : 1000);
-
-      const estimatedCapital = numQty * (numPrice > 0 ? numPrice : executedPrice);
-      if (estimatedCapital > MAX_ORDER_CAPITAL_LIMIT) {
-        return res.status(400).json({
-          error: `Pre-trade risk violation: Total order value (₹${Math.round(estimatedCapital).toLocaleString('en-IN')}) exceeds safety ceiling of ₹${MAX_ORDER_CAPITAL_LIMIT.toLocaleString('en-IN')}.`,
-        });
-      }
-
-      const orderId = `PO-${Date.now().toString().slice(-6)}-${Math.floor(Math.random() * 1000)}`;
-      const now = nowIST().label;
-
-      if (!isPaper) {
-        // Real FYERS Order Placement
-        const { appId, token } = getTradingFyersAuth();
-        if (!appId || !token) {
-          return res.status(400).json({ error: "FYERS API credentials missing for live order placement" });
-        }
-
-        const fyersSide = side === 'BUY' ? 1 : -1;
-        const fyersType = orderType === 'LIMIT' ? 1 : orderType === 'MARKET' ? 2 : orderType === 'SL' ? 3 : 4;
-
-        const fyersPayload = {
-          symbol,
-          qty: numQty,
-          type: fyersType,
-          side: fyersSide,
-          productType: product === 'CNC' ? 'CNC' : 'INTRADAY',
-          limitPrice: orderType === 'LIMIT' ? numPrice : 0,
-          stopPrice: triggerPrice ? Number(triggerPrice) : 0,
-          validity: 'DAY',
-          disclosedQty: 0,
-          offlineOrder: false,
-        };
-
-        const fyersRes = await fetch("https://api-t1.fyers.in/api/v3/orders/sync", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `${appId}:${token}`,
-          },
-          body: JSON.stringify(fyersPayload),
-        });
-
-        const fyersData = await fyersRes.json();
-        broadcastSseEvent("order_update", {
-          type: "LIVE_ORDER_PLACED",
-          symbol,
-          side,
-          qty: numQty,
-          orderId: fyersData.id || orderId,
-        });
-        return res.json({ fyersOrder: true, ...fyersData });
-      }
-
-      // Paper Trading: Check if limit order should be PENDING or filled immediately
-      let isPending = false;
-      if (orderType === 'LIMIT') {
-        if (side === 'BUY' && executedPrice > numPrice) isPending = true;
-        if (side === 'SELL' && executedPrice < numPrice) isPending = true;
-      } else if (orderType === 'SL') {
-        isPending = true;
-      }
-
-      const initialStatus = isPending ? 'PENDING' : 'COMPLETE';
-      const actualExecPrice = isPending ? null : executedPrice;
-
-      // Insert Paper Order with stop_loss and take_profit metadata
-      db.prepare(`
-        INSERT INTO paper_orders (id, symbol, side, order_type, product, qty, price, trigger_price, status, executed_price, stop_loss, take_profit, created_at)
-        VALUES (@id, @symbol, @side, @order_type, @product, @qty, @price, @trigger_price, @status, @executed_price, @stop_loss, @take_profit, @created_at)
-      `).run({
-        id: orderId,
+      const fyersPayload = {
         symbol,
-        side,
-        order_type: orderType || 'MARKET',
-        product: product || 'INTRADAY',
         qty: numQty,
-        price: numPrice > 0 ? numPrice : executedPrice,
-        trigger_price: triggerPrice ? Number(triggerPrice) : null,
-        status: initialStatus,
-        executed_price: actualExecPrice,
-        stop_loss: numSL,
-        take_profit: numTP,
-        created_at: now,
+        type: fyersType,
+        side: fyersSide,
+        productType: product === "CNC" ? "CNC" : "INTRADAY",
+        limitPrice: orderType === "LIMIT" ? numPrice : 0,
+        stopPrice: triggerPrice ? Number(triggerPrice) : 0,
+        validity: "DAY",
+        disclosedQty: 0,
+        offlineOrder: false,
+      };
+
+      const fyersRes = await fetch("https://api-t1.fyers.in/api/v3/orders/sync", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `${appId}:${token}`,
+        },
+        body: JSON.stringify(fyersPayload),
       });
 
-      if (isPending) {
-        broadcastSseEvent("order_update", {
-          type: "ORDER_PENDING",
-          orderId,
-          symbol,
-          side,
-          qty: numQty,
-          price: numPrice,
-          message: `⏳ Order Placed as PENDING: ${side} ${numQty} ${symbol} @ ₹${numPrice} (Current LTP: ₹${executedPrice})`,
-        });
-
-        return res.json({
-          success: true,
-          orderId,
-          price: numPrice,
-          qty: numQty,
-          side,
-          status: "PENDING",
-          message: `Limit order accepted and waiting for market trigger at ₹${numPrice}`,
-        });
-      }
-
-      // If immediately filled, update positions
-      const existingPos = db.prepare("SELECT * FROM paper_positions WHERE symbol = @symbol").get({ symbol }) as any;
-      if (!existingPos) {
-        db.prepare(`
-          INSERT INTO paper_positions (symbol, side, product, qty, avg_price, updated_at)
-          VALUES (@symbol, @side, @product, @qty, @avg_price, @updated_at)
-        `).run({
-          symbol,
-          side,
-          product: product || 'INTRADAY',
-          qty: numQty,
-          avg_price: executedPrice,
-          updated_at: now,
-        });
-      } else {
-        if (existingPos.side === side) {
-          const totalQty = existingPos.qty + numQty;
-          const newAvgPrice = ((existingPos.avg_price * existingPos.qty) + (executedPrice * numQty)) / totalQty;
-          db.prepare("UPDATE paper_positions SET qty = @qty, avg_price = @avg_price, updated_at = @updated_at WHERE symbol = @symbol")
-            .run({ qty: totalQty, avg_price: Number(newAvgPrice.toFixed(2)), updated_at: now, symbol });
-        } else {
-          const remainingQty = existingPos.qty - numQty;
-          if (remainingQty <= 0) {
-            db.prepare("DELETE FROM paper_positions WHERE symbol = @symbol").run({ symbol });
-            if (remainingQty < 0) {
-              db.prepare(`
-                INSERT INTO paper_positions (symbol, side, product, qty, avg_price, updated_at)
-                VALUES (@symbol, @side, @product, @qty, @avg_price, @updated_at)
-              `).run({
-                symbol,
-                side,
-                product: product || 'INTRADAY',
-                qty: Math.abs(remainingQty),
-                avg_price: executedPrice,
-                updated_at: now,
-              });
-            }
-          } else {
-            db.prepare("UPDATE paper_positions SET qty = @qty, updated_at = @updated_at WHERE symbol = @symbol")
-              .run({ qty: remainingQty, updated_at: now, symbol });
-          }
-        }
-      }
+      const fyersData = (await fyersRes.json()) as any;
+      const liveId = fyersData.id || orderId;
 
       broadcastSseEvent("order_update", {
-        type: "ORDER_FILLED",
-        orderId,
+        type: "LIVE_ORDER_PLACED",
+        symbol,
+        side,
+        qty: numQty,
+        orderId: liveId,
+      });
+
+      telegramService.notifyOrderEvent({
+        orderId: liveId,
         symbol,
         side,
         qty: numQty,
         price: executedPrice,
-        message: `✅ Order Filled: ${side} ${numQty} ${symbol} @ ₹${executedPrice}`,
+        status: fyersData.s === "ok" ? "PLACED" : "REJECTED",
+        isPaper: false,
+        reason: fyersData.message,
+      }).catch(() => {});
+
+      return { success: fyersData.s === "ok", orderId: liveId, message: fyersData.message || "Order sent to FYERS", data: fyersData };
+    }
+
+    // Paper Trading
+    let isPending = false;
+    if (orderType === "LIMIT") {
+      if (side === "BUY" && executedPrice > numPrice) isPending = true;
+      if (side === "SELL" && executedPrice < numPrice) isPending = true;
+    } else if (orderType === "SL") {
+      isPending = true;
+    }
+
+    const initialStatus = isPending ? "PENDING" : "COMPLETE";
+    const actualExecPrice = isPending ? null : executedPrice;
+
+    db.prepare(`
+      INSERT INTO paper_orders (id, symbol, side, order_type, product, qty, price, trigger_price, status, executed_price, stop_loss, take_profit, created_at)
+      VALUES (@id, @symbol, @side, @order_type, @product, @qty, @price, @trigger_price, @status, @executed_price, @stop_loss, @take_profit, @created_at)
+    `).run({
+      id: orderId,
+      symbol,
+      side,
+      order_type: orderType || "MARKET",
+      product: product || "INTRADAY",
+      qty: numQty,
+      price: numPrice > 0 ? numPrice : executedPrice,
+      trigger_price: triggerPrice ? Number(triggerPrice) : null,
+      status: initialStatus,
+      executed_price: actualExecPrice,
+      stop_loss: numSL,
+      take_profit: numTP,
+      created_at: now,
+    });
+
+    if (isPending) {
+      broadcastSseEvent("order_update", {
+        type: "ORDER_PENDING",
+        orderId,
+        symbol,
+        side,
+        qty: numQty,
+        price: numPrice,
+        message: `⏳ Order Placed as PENDING: ${side} ${numQty} ${symbol} @ ₹${numPrice} (Current LTP: ₹${executedPrice})`,
       });
 
-      res.json({
+      telegramService.notifyOrderEvent({
+        orderId,
+        symbol,
+        side,
+        qty: numQty,
+        price: numPrice,
+        status: "PENDING",
+        isPaper: true,
+        reason: `Limit order waiting at ₹${numPrice}`,
+      }).catch(() => {});
+
+      return {
         success: true,
         orderId,
-        executedPrice,
-        qty: numQty,
+        message: `Limit order accepted and waiting for market trigger at ₹${numPrice}`,
+        data: { status: "PENDING", executedPrice: null },
+      };
+    }
+
+    // Immediately filled, update positions
+    const existingPos = db.prepare("SELECT * FROM paper_positions WHERE symbol = @symbol").get({ symbol }) as any;
+    if (!existingPos) {
+      db.prepare(`
+        INSERT INTO paper_positions (symbol, side, product, qty, avg_price, updated_at)
+        VALUES (@symbol, @side, @product, @qty, @avg_price, @updated_at)
+      `).run({
+        symbol,
         side,
-        status: "COMPLETE",
+        product: product || "INTRADAY",
+        qty: numQty,
+        avg_price: executedPrice,
+        updated_at: now,
       });
-    } catch (err) {
-      res.status(500).json({ error: "Failed to place order", detail: String(err) });
+    } else {
+      if (existingPos.side === side) {
+        const totalQty = existingPos.qty + numQty;
+        const newAvgPrice = ((existingPos.avg_price * existingPos.qty) + (executedPrice * numQty)) / totalQty;
+        db.prepare("UPDATE paper_positions SET qty = @qty, avg_price = @avg_price, updated_at = @updated_at WHERE symbol = @symbol")
+          .run({ qty: totalQty, avg_price: Number(newAvgPrice.toFixed(2)), updated_at: now, symbol });
+      } else {
+        const remainingQty = existingPos.qty - numQty;
+        if (remainingQty <= 0) {
+          db.prepare("DELETE FROM paper_positions WHERE symbol = @symbol").run({ symbol });
+          if (remainingQty < 0) {
+            db.prepare(`
+              INSERT INTO paper_positions (symbol, side, product, qty, avg_price, updated_at)
+              VALUES (@symbol, @side, @product, @qty, @avg_price, @updated_at)
+            `).run({
+              symbol,
+              side,
+              product: product || "INTRADAY",
+              qty: Math.abs(remainingQty),
+              avg_price: executedPrice,
+              updated_at: now,
+            });
+          }
+        } else {
+          db.prepare("UPDATE paper_positions SET qty = @qty, updated_at = @updated_at WHERE symbol = @symbol")
+            .run({ qty: remainingQty, updated_at: now, symbol });
+        }
+      }
+    }
+
+    broadcastSseEvent("order_update", {
+      type: "ORDER_FILLED",
+      orderId,
+      symbol,
+      side,
+      qty: numQty,
+      price: executedPrice,
+      message: `✅ Order Filled: ${side} ${numQty} ${symbol} @ ₹${executedPrice}`,
+    });
+
+    telegramService.notifyOrderEvent({
+      orderId,
+      symbol,
+      side,
+      qty: numQty,
+      price: executedPrice,
+      status: "FILLED",
+      isPaper: true,
+    }).catch(() => {});
+
+    return {
+      success: true,
+      orderId,
+      executedPrice,
+      message: `Filled: ${side} ${numQty} ${symbol} @ ₹${executedPrice}`,
+      data: { status: "COMPLETE", executedPrice, qty: numQty, side },
+    };
+  }
+
+  // Internal helper for order cancellation
+  async function cancelOrderInternal(id: string, isPaper: boolean): Promise<{ success: boolean; message: string }> {
+    if (!id) return { success: false, message: "Order ID is required to cancel" };
+
+    if (!isPaper) {
+      const { appId, token } = getTradingFyersAuth();
+      if (!appId || !token) {
+        return { success: false, message: "FYERS API credentials missing for order cancellation" };
+      }
+      const fyersRes = await fetch("https://api-t1.fyers.in/api/v3/orders/sync", {
+        method: "DELETE",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `${appId}:${token}`,
+        },
+        body: JSON.stringify({ id }),
+      });
+      const fData = (await fyersRes.json()) as any;
+      broadcastSseEvent("order_update", { type: "ORDER_CANCELLED", id, isPaper: false });
+      telegramService.notifyOrderEvent({ orderId: id, symbol: "", side: "", qty: 0, price: 0, status: "CANCELLED", isPaper: false }).catch(() => {});
+      return { success: fData.s === "ok", message: fData.message || "Order cancelled via FYERS" };
+    }
+
+    const result = db.prepare("UPDATE paper_orders SET status = 'CANCELLED' WHERE id = @id AND status = 'PENDING'").run({ id });
+    if (result.changes > 0) {
+      broadcastSseEvent("order_update", {
+        type: "ORDER_CANCELLED",
+        orderId: id,
+        isPaper: true,
+        message: `🚫 Order ${id} has been cancelled.`,
+      });
+      telegramService.notifyOrderEvent({ orderId: id, symbol: "", side: "", qty: 0, price: 0, status: "CANCELLED", isPaper: true }).catch(() => {});
+      return { success: true, message: `Order ${id} cancelled successfully.` };
+    } else {
+      return { success: false, message: "Order not found or is no longer in PENDING state" };
+    }
+  }
+
+  // API: Trading - Place Order (Paper or Real FYERS)
+  app.post("/api/trading/order", async (req, res) => {
+    try {
+      const result = await executeOrderInternal(req.body);
+      if (!result.success) {
+        return res.status(400).json({ error: result.message, ...result });
+      }
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: "Failed to place order", detail: String(err?.message || err) });
     }
   });
 
@@ -3190,40 +3662,11 @@ async function startServer() {
   app.post("/api/trading/order/cancel", async (req, res) => {
     try {
       const { id, isPaper = true } = req.body;
-      if (!id) {
-        return res.status(400).json({ error: "Order ID is required to cancel" });
+      const result = await cancelOrderInternal(id, isPaper);
+      if (!result.success) {
+        return res.status(400).json({ error: result.message });
       }
-
-      if (!isPaper) {
-        const { appId, token } = getTradingFyersAuth();
-        if (!appId || !token) {
-          return res.status(400).json({ error: "FYERS API credentials missing for order cancellation" });
-        }
-        const fyersRes = await fetch("https://api-t1.fyers.in/api/v3/orders/sync", {
-          method: "DELETE",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `${appId}:${token}`,
-          },
-          body: JSON.stringify({ id }),
-        });
-        const fData = await fyersRes.json();
-        broadcastSseEvent("order_update", { type: "ORDER_CANCELLED", id, isPaper: false });
-        return res.json({ fyersCancel: true, ...fData });
-      }
-
-      const result = db.prepare("UPDATE paper_orders SET status = 'CANCELLED' WHERE id = @id AND status = 'PENDING'").run({ id });
-      if (result.changes > 0) {
-        broadcastSseEvent("order_update", {
-          type: "ORDER_CANCELLED",
-          orderId: id,
-          isPaper: true,
-          message: `🚫 Order ${id} has been cancelled.`,
-        });
-        return res.json({ success: true, message: `Order ${id} cancelled successfully.` });
-      } else {
-        return res.status(400).json({ error: "Order not found or is no longer in PENDING state" });
-      }
+      res.json(result);
     } catch (err: any) {
       res.status(500).json({ error: "Failed to cancel order", detail: err.message });
     }
@@ -3370,64 +3813,135 @@ async function startServer() {
     }
   });
 
+  // Internal helper for squaring off a single position
+  async function squareOffPositionInternal(symbol: string, isPaper: boolean): Promise<{ success: boolean; message: string; pnl?: number; executedPrice?: number; data?: any }> {
+    if (!symbol) return { success: false, message: "Symbol is required for square off" };
+
+    if (!isPaper) {
+      const { appId, token } = getTradingFyersAuth();
+      if (!appId || !token) {
+        return { success: false, message: "FYERS credentials missing for square off" };
+      }
+      const fyersRes = await fetch("https://api-t1.fyers.in/api/v3/positions", {
+        method: "DELETE",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `${appId}:${token}`,
+        },
+        body: JSON.stringify({ id: symbol }),
+      });
+      const fyersData = (await fyersRes.json()) as any;
+      telegramService.sendAlert(`🔴 <b>Live Position Square-Off Dispatched:</b> <code>${symbol}</code>`).catch(() => {});
+      return { success: fyersData.s === "ok", message: fyersData.message || "Square-off sent to FYERS", data: fyersData };
+    }
+
+    const pos = db.prepare("SELECT * FROM paper_positions WHERE symbol = @symbol").get({ symbol }) as any;
+    if (!pos) return { success: false, message: "Position not found in paper trading" };
+
+    const liveQuotes = await fetchFyersQuotes([symbol]);
+    const liveQ = liveQuotes.get(symbol);
+    const latestTick = db.prepare("SELECT ltp FROM ticks WHERE symbol = @symbol ORDER BY id DESC LIMIT 1").get({ symbol }) as any;
+    const executedPrice = liveQ?.lp ?? latestTick?.ltp ?? basePrices[symbol]?.price ?? pos.avg_price;
+    const exitSide = pos.side === "BUY" ? "SELL" : "BUY";
+    const orderId = `PO-EXIT-${Date.now().toString().slice(-6)}`;
+    const now = nowIST().label;
+
+    db.prepare(`
+      INSERT INTO paper_orders (id, symbol, side, order_type, product, qty, price, trigger_price, status, executed_price, created_at)
+      VALUES (@id, @symbol, @side, 'MARKET', @product, @qty, @price, NULL, 'COMPLETE', @executed_price, @created_at)
+    `).run({
+      id: orderId,
+      symbol,
+      side: exitSide,
+      product: pos.product,
+      qty: pos.qty,
+      price: executedPrice,
+      executed_price: executedPrice,
+      created_at: now,
+    });
+
+    db.prepare("DELETE FROM paper_positions WHERE symbol = @symbol").run({ symbol });
+
+    const pnl = pos.side === "BUY"
+      ? (executedPrice - pos.avg_price) * pos.qty
+      : (pos.avg_price - executedPrice) * pos.qty;
+
+    telegramService.notifyOrderEvent({
+      orderId,
+      symbol,
+      side: exitSide,
+      qty: pos.qty,
+      price: executedPrice,
+      status: "SQUARE_OFF",
+      isPaper: true,
+      reason: `Closed ${pos.qty} shares. Realized P&L: ₹${pnl.toFixed(2)}`,
+    }).catch(() => {});
+
+    return {
+      success: true,
+      message: `Squared off ${symbol}`,
+      pnl: Number(pnl.toFixed(2)),
+      executedPrice,
+    };
+  }
+
+  // Internal helper to square off all active positions
+  async function squareOffAllPositionsInternal(isPaper: boolean): Promise<{ success: boolean; closedCount: number; message: string }> {
+    let closedCount = 0;
+    try {
+      if (!isPaper) {
+        const { appId, token } = getTradingFyersAuth();
+        if (!appId || !token) return { success: false, closedCount: 0, message: "FYERS credentials missing for live square off" };
+        const fyersRes = await fetch("https://api-t1.fyers.in/api/v3/positions", {
+          headers: { Authorization: `${appId}:${token}` },
+        });
+        const data = (await fyersRes.json()) as any;
+        const positions = data.netPositions || [];
+        for (const p of positions) {
+          if (p.netQty !== 0) {
+            await squareOffPositionInternal(p.symbol, false);
+            closedCount++;
+          }
+        }
+        telegramService.sendAlert(`🚨 <b>EMERGENCY SQUARE-OFF EXECUTED</b>\nClosed ${closedCount} LIVE FYERS positions.`).catch(() => {});
+        return { success: true, closedCount, message: `Squared off ${closedCount} live positions.` };
+      }
+
+      const positions = db.prepare("SELECT symbol FROM paper_positions WHERE qty > 0").all() as any[];
+      for (const p of positions) {
+        await squareOffPositionInternal(p.symbol, true);
+        closedCount++;
+      }
+      telegramService.sendAlert(`🚨 <b>EMERGENCY SQUARE-OFF EXECUTED</b>\nClosed ${closedCount} Paper Trading positions.`).catch(() => {});
+      return { success: true, closedCount, message: `Squared off ${closedCount} paper positions.` };
+    } catch (err: any) {
+      return { success: false, closedCount, message: `Error during square off all: ${err?.message || err}` };
+    }
+  }
+
   // API: Trading - Square Off Position
   app.post("/api/trading/squareoff/:symbol", async (req, res) => {
     try {
       const symbol = req.params.symbol;
       const isPaper = req.query.isPaper !== "false";
-
-      if (!isPaper) {
-        // Exit position via FYERS API
-        const { appId, token } = getTradingFyersAuth();
-        if (!appId || !token) {
-          return res.status(400).json({ error: "FYERS credentials missing for square off" });
-        }
-        const fyersRes = await fetch("https://api-t1.fyers.in/api/v3/positions", {
-          method: "DELETE",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `${appId}:${token}`,
-          },
-          body: JSON.stringify({ id: symbol }),
-        });
-        const fyersData = await fyersRes.json();
-        return res.json({ fyersExit: true, ...fyersData });
+      const result = await squareOffPositionInternal(symbol, isPaper);
+      if (!result.success) {
+        return res.status(400).json({ error: result.message });
       }
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: "Failed to square off", detail: String(err?.message || err) });
+    }
+  });
 
-      const pos = db.prepare("SELECT * FROM paper_positions WHERE symbol = @symbol").get({ symbol }) as any;
-      if (!pos) return res.status(404).json({ error: "Position not found" });
-
-      const liveQuotes = await fetchFyersQuotes([symbol]);
-      const liveQ = liveQuotes.get(symbol);
-      const latestTick = db.prepare("SELECT ltp FROM ticks WHERE symbol = @symbol ORDER BY id DESC LIMIT 1").get({ symbol }) as any;
-      const executedPrice = liveQ?.lp ?? latestTick?.ltp ?? basePrices[symbol]?.price ?? pos.avg_price;
-      const exitSide = pos.side === 'BUY' ? 'SELL' : 'BUY';
-      const orderId = `PO-EXIT-${Date.now().toString().slice(-6)}`;
-      const now = nowIST().label;
-
-      db.prepare(`
-        INSERT INTO paper_orders (id, symbol, side, order_type, product, qty, price, trigger_price, status, executed_price, created_at)
-        VALUES (@id, @symbol, @side, 'MARKET', @product, @qty, @price, NULL, 'COMPLETE', @executed_price, @created_at)
-      `).run({
-        id: orderId,
-        symbol,
-        side: exitSide,
-        product: pos.product,
-        qty: pos.qty,
-        price: executedPrice,
-        executed_price: executedPrice,
-        created_at: now,
-      });
-
-      db.prepare("DELETE FROM paper_positions WHERE symbol = @symbol").run({ symbol });
-
-      const pnl = pos.side === 'BUY'
-        ? (executedPrice - pos.avg_price) * pos.qty
-        : (pos.avg_price - executedPrice) * pos.qty;
-
-      res.json({ success: true, message: `Squared off ${symbol}`, pnl: Number(pnl.toFixed(2)), executedPrice });
-    } catch (err) {
-      res.status(500).json({ error: "Failed to square off", detail: String(err) });
+  // API: Trading - Emergency Square Off All Positions
+  app.post("/api/trading/squareoff-all", async (req, res) => {
+    try {
+      const isPaper = req.query.isPaper !== "false";
+      const result = await squareOffAllPositionsInternal(isPaper);
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: "Failed to square off all positions", detail: String(err?.message || err) });
     }
   });
 
@@ -3435,8 +3949,8 @@ async function startServer() {
   app.get("/api/screener/data", async (req, res) => {
     try {
       const now = Date.now();
-      // Use cached screener data if younger than 4 seconds
-      if (screenerCache && (now - screenerCache.timestamp) < 4000) {
+      // Use cached screener data if younger than 15 seconds to prevent Cloudflare rate limits
+      if (screenerCache && (now - screenerCache.timestamp) < 15000) {
         return res.json(screenerCache.data);
       }
 
@@ -3449,32 +3963,32 @@ async function startServer() {
             sector: "Diversified",
           }));
 
-      // Fetch 100% real live FYERS quotes in batches of 50
       const symbolsToFetch = rawList.slice(0, 150).map(item => item.symbol);
       const quotesMap = await fetchFyersQuotes(symbolsToFetch);
 
       // Compute enriched screener metrics using REAL FYERS data
       const screenerData = rawList.slice(0, 150).map((item, index) => {
         const sym = item.symbol;
+        const liveCached = globalLiveQuoteCache.get(sym);
         const q = quotesMap.get(sym);
         const tick = db.prepare("SELECT ltp, chng, pchange, open, high, low, volume FROM ticks WHERE symbol = @symbol ORDER BY id DESC LIMIT 1").get({ symbol: sym }) as any;
         const base = basePrices[sym]?.price || (100 + (index * 37) % 2500);
 
         const num = (v: any, def = 0) => (v != null && !isNaN(Number(v)) ? Number(Number(v).toFixed(2)) : def);
 
-        // Prefer real FYERS quote -> then latest SQLite tick -> then base
-        const ltp = q?.lp != null ? num(q.lp) : (tick?.ltp ?? num(base * (1 + (Math.sin(index) * 0.015))));
-        const change = q?.ch != null ? num(q.ch) : (tick?.chng ?? num(ltp * 0.01));
-        const pChange = q?.chp != null ? num(q.chp) : (tick?.pchange ?? (ltp > 0 ? num((change / ltp) * 100) : 0));
-        const high = q?.high_price != null ? num(q.high_price) : (tick?.high ?? num(ltp * 1.018));
-        const low = q?.low_price != null ? num(q.low_price) : (tick?.low ?? num(ltp * 0.982));
-        const volume = q?.volume != null ? Number(q.volume) : (tick?.volume ?? Math.floor(150000 + (Math.abs(Math.cos(index)) * 2500000)));
-        const vwap = q?.atp != null ? num(q.atp) : num((high + low + ltp) / 3);
-        const bid = q?.bid != null ? num(q.bid) : num(ltp - 0.05);
-        const ask = q?.ask != null ? num(q.ask) : num(ltp + 0.05);
-        const spread = q?.spread != null ? num(q.spread) : num(Math.max(0, ask - bid));
-        const open = q?.open_price != null ? num(q.open_price) : (tick?.open ?? num(ltp - (change * 0.35)));
-        const prevClose = q?.prev_close_price != null ? num(q.prev_close_price) : (tick?.close ?? num(ltp - change));
+        // Priority 1: In-memory live WebSocket cache -> Priority 2: REST quote -> Priority 3: SQLite tick -> Fallback base
+        const ltp = liveCached?.ltp ?? (q?.lp != null ? num(q.lp) : (tick?.ltp ?? num(base * (1 + (Math.sin(index) * 0.015)))));
+        const change = liveCached?.change ?? (q?.ch != null ? num(q.ch) : (tick?.chng ?? num(ltp * 0.01)));
+        const pChange = liveCached?.pChange ?? (q?.chp != null ? num(q.chp) : (tick?.pchange ?? (ltp > 0 ? num((change / ltp) * 100) : 0)));
+        const high = liveCached?.high ?? (q?.high_price != null ? num(q.high_price) : (tick?.high ?? num(ltp * 1.018)));
+        const low = liveCached?.low ?? (q?.low_price != null ? num(q.low_price) : (tick?.low ?? num(ltp * 0.982)));
+        const volume = liveCached?.volume ?? (q?.volume != null ? Number(q.volume) : (tick?.volume ?? Math.floor(150000 + (Math.abs(Math.cos(index)) * 2500000))));
+        const vwap = liveCached?.vwap ?? (q?.atp != null ? num(q.atp) : num((high + low + ltp) / 3));
+        const bid = liveCached?.bid ?? (q?.bid != null ? num(q.bid) : num(ltp - 0.05));
+        const ask = liveCached?.ask ?? (q?.ask != null ? num(q.ask) : num(ltp + 0.05));
+        const spread = liveCached?.spread ?? (q?.spread != null ? num(q.spread) : num(Math.max(0, ask - bid)));
+        const open = liveCached?.open ?? (q?.open_price != null ? num(q.open_price) : (tick?.open ?? num(ltp - (change * 0.35))));
+        const prevClose = liveCached?.prevClose ?? (q?.prev_close_price != null ? num(q.prev_close_price) : (tick?.close ?? num(ltp - change)));
         const gapPct = prevClose > 0 ? num(((open - prevClose) / prevClose) * 100) : 0;
         const rsi = Math.min(95, Math.max(15, Math.round(50 + (pChange * 6))));
 
@@ -3499,7 +4013,7 @@ async function startServer() {
           rsi,
           high52w: Number((ltp * 1.25).toFixed(2)),
           low52w: Number((ltp * 0.75).toFixed(2)),
-          isRealFyers: Boolean(q),
+          isRealFyers: Boolean(liveCached || q || tick),
         };
       });
 
@@ -4214,14 +4728,24 @@ async function startServer() {
             pnl: Number((h.pl || 0).toFixed(2)),
             pnlPercent: Number((h.pnlPercentage || 0).toFixed(2)),
           }));
+          const rawOverall = fyersData.overall || {};
+          const mappedInvested = mapped.reduce((acc: number, h: any) => acc + (h.investedValue || 0), 0);
+          const mappedCurrent = mapped.reduce((acc: number, h: any) => acc + (h.currentValue || 0), 0);
+          const mappedPl = mapped.reduce((acc: number, h: any) => acc + (h.pnl || 0), 0);
+
+          const total_invested = Number((rawOverall.total_invested ?? rawOverall.total_investment ?? mappedInvested ?? 0).toFixed(2));
+          const total_current = Number((rawOverall.total_current ?? rawOverall.total_current_value ?? mappedCurrent ?? 0).toFixed(2));
+          const total_pl = Number((rawOverall.total_pl ?? mappedPl ?? 0).toFixed(2));
+          const pnl_percentage = Number((rawOverall.pnl_percentage ?? rawOverall.pnl_perc ?? (total_invested > 0 ? ((total_current - total_invested) / total_invested) * 100 : 0)).toFixed(2));
+
           return res.json({
             isPaper: false,
             holdings: mapped,
-            overall: fyersData.overall || {
-              total_invested: mapped.reduce((acc: number, h: any) => acc + h.investedValue, 0),
-              total_current: mapped.reduce((acc: number, h: any) => acc + h.currentValue, 0),
-              total_pl: mapped.reduce((acc: number, h: any) => acc + h.pnl, 0),
-              pnl_percentage: 0,
+            overall: {
+              total_invested,
+              total_current,
+              total_pl,
+              pnl_percentage,
             }
           });
         }
@@ -4562,6 +5086,54 @@ async function startServer() {
     }
   });
 
+  // ==========================================================================
+  // API: Market Data Daemon Status & User Toggle
+  // ==========================================================================
+  app.get("/api/market/daemon/status", (_req, res) => {
+    res.json({
+      active: daemonActive && !!daemonPythonProcess,
+      pid: daemonPythonProcess?.pid || null,
+      symbolsCount: subscribedSymbolSet.size,
+      symbols: Array.from(subscribedSymbolSet),
+      cacheCount: globalLiveQuoteCache.size,
+      userDisabled: daemonUserDisabled,
+    });
+  });
+
+  app.all("/api/market/daemon/toggle", (req, res) => {
+    const rawEnable = req.query.enable !== undefined ? req.query.enable : req.body?.enable;
+    const enable = rawEnable !== undefined ? (rawEnable === true || rawEnable === "true" || rawEnable === 1 || rawEnable === "1") : undefined;
+    const targetState = typeof enable === "boolean" ? enable : !daemonActive;
+
+    if (!targetState) {
+      daemonUserDisabled = true;
+      killMarketDataDaemon();
+      console.log("[MARKET_DAEMON] Daemon stopped by user via explicit UI toggle.");
+      res.json({
+        success: true,
+        active: false,
+        pid: null,
+        message: "Market Data Daemon paused.",
+        symbolsCount: subscribedSymbolSet.size,
+        cacheCount: globalLiveQuoteCache.size,
+        userDisabled: true,
+      });
+    } else {
+      daemonUserDisabled = false;
+      startMarketDataDaemon();
+      console.log("[MARKET_DAEMON] Daemon started by user via explicit UI toggle.");
+      res.json({
+        success: true,
+        active: true,
+        pid: daemonPythonProcess?.pid || null,
+        message: "Market Data Daemon started.",
+        symbolsCount: subscribedSymbolSet.size,
+        cacheCount: globalLiveQuoteCache.size,
+        userDisabled: false,
+      });
+    }
+  });
+
   // API: SSE Stream endpoint
   app.get("/api/stream", (req, res) => {
     res.setHeader("Content-Type", "text/event-stream");
@@ -4599,6 +5171,296 @@ async function startServer() {
     });
   });
 
+  // ============================================================================
+  // TELEGRAM BOT INTEGRATION & REST APIS
+  // ============================================================================
+  telegramService.setBridge({
+    getQuotes: async (symbols: string[]) => {
+      const targetSymbols = symbols.length > 0 ? symbols : Array.from(subscribedSymbolSet);
+      const quotesMap = new Map<string, any>();
+      const missing: string[] = [];
+
+      for (const sym of targetSymbols) {
+        const cached = globalLiveQuoteCache.get(sym);
+        if (cached) {
+          quotesMap.set(sym, cached);
+        } else {
+          missing.push(sym);
+        }
+      }
+
+      if (missing.length > 0) {
+        try {
+          const liveQuotes = await fetchFyersQuotes(missing);
+          for (const [sym, q] of Array.from(liveQuotes.entries())) {
+            quotesMap.set(sym, {
+              symbol: sym,
+              ltp: q.lp,
+              change: q.ch,
+              pChange: q.chp,
+              high: q.high_price,
+              low: q.low_price,
+              open: q.open_price,
+              prevClose: q.prev_close_price,
+              volume: q.volume,
+              vwap: q.lp,
+              bid: q.bid,
+              ask: q.ask,
+              spread: (q.ask || q.lp) - (q.bid || q.lp),
+              timestamp: Date.now(),
+              isRealFyers: true,
+            });
+          }
+        } catch {}
+      }
+      return quotesMap;
+    },
+
+    getQuote: async (symbol: string) => {
+      const cached = globalLiveQuoteCache.get(symbol);
+      if (cached) return cached;
+      try {
+        const liveQuotes = await fetchFyersQuotes([symbol]);
+        const q = liveQuotes.get(symbol);
+        if (q) {
+          return {
+            symbol,
+            ltp: q.lp,
+            change: q.ch,
+            pChange: q.chp,
+            high: q.high_price,
+            low: q.low_price,
+            open: q.open_price,
+            prevClose: q.prev_close_price,
+            volume: q.volume,
+            vwap: q.lp,
+            bid: q.bid,
+            ask: q.ask,
+            spread: (q.ask || q.lp) - (q.bid || q.lp),
+            timestamp: Date.now(),
+            isRealFyers: true,
+          };
+        }
+      } catch {}
+      const lastTick = db.prepare("SELECT ltp, high, low, open, close, volume FROM ticks WHERE symbol = @symbol ORDER BY id DESC LIMIT 1").get({ symbol }) as any;
+      if (lastTick) {
+        return {
+          symbol,
+          ltp: lastTick.ltp,
+          change: 0,
+          pChange: 0,
+          high: lastTick.high || lastTick.ltp,
+          low: lastTick.low || lastTick.ltp,
+          open: lastTick.open || lastTick.ltp,
+          prevClose: lastTick.close || lastTick.ltp,
+          volume: lastTick.volume || 0,
+          vwap: lastTick.ltp,
+          bid: lastTick.ltp,
+          ask: lastTick.ltp,
+          spread: 0,
+          timestamp: Date.now(),
+          isRealFyers: false,
+        };
+      }
+      return null;
+    },
+
+    getFunds: async (isPaper: boolean) => {
+      if (!isPaper) {
+        const { appId, token } = getTradingFyersAuth();
+        if (!appId || !token) throw new Error("FYERS credentials missing for live trading");
+        const fyersRes = await fetch("https://api-t1.fyers.in/api/v3/funds", {
+          headers: { Authorization: `${appId}:${token}` },
+        });
+        const fyersData = (await fyersRes.json()) as any;
+        const fundLimits = fyersData.fund_limit || [];
+        return {
+          isPaper: false,
+          totalBalance: fundLimits.find((f: any) => f.title === "Total Balance" || f.id === 1)?.equityAmount || 0,
+          availableBalance: fundLimits.find((f: any) => f.title === "Available Balance" || f.id === 10)?.equityAmount || 0,
+          utilizedAmount: fundLimits.find((f: any) => f.title === "Utilized Amount" || f.id === 2)?.equityAmount || 0,
+          realizedPnl: fundLimits.find((f: any) => f.title === "Realized Profit and Loss" || f.id === 4)?.equityAmount || 0,
+        };
+      }
+      const positions = db.prepare("SELECT * FROM paper_positions WHERE qty > 0").all() as any[];
+      const totalVal = positions.reduce((sum, p) => sum + (p.qty * p.avg_price), 0);
+      const usedMargin = totalVal / 5;
+      const initialCapital = 1000000;
+      return {
+        isPaper: true,
+        totalBalance: initialCapital,
+        availableBalance: Math.max(0, initialCapital - usedMargin),
+        utilizedAmount: usedMargin,
+        realizedPnl: 0,
+      };
+    },
+
+    getPositions: async (isPaper: boolean) => {
+      if (!isPaper) {
+        const { appId, token } = getTradingFyersAuth();
+        if (!appId || !token) throw new Error("FYERS credentials missing for live trading");
+        const fyersRes = await fetch("https://api-t1.fyers.in/api/v3/positions", {
+          headers: { Authorization: `${appId}:${token}` },
+        });
+        const fyersData = (await fyersRes.json()) as any;
+        return fyersData.netPositions || [];
+      }
+      const positions = db.prepare("SELECT * FROM paper_positions WHERE qty > 0").all() as any[];
+      return positions.map((p) => {
+        const cached = globalLiveQuoteCache.get(p.symbol);
+        const ltp = cached?.ltp || p.avg_price;
+        const pnl = p.side === "BUY" ? (ltp - p.avg_price) * p.qty : (p.avg_price - ltp) * p.qty;
+        return {
+          ...p,
+          ltp,
+          pnl: Number(pnl.toFixed(2)),
+        };
+      });
+    },
+
+    getOrders: async (isPaper: boolean) => {
+      if (!isPaper) {
+        const { appId, token } = getTradingFyersAuth();
+        if (!appId || !token) throw new Error("FYERS credentials missing for live trading");
+        const fyersRes = await fetch("https://api-t1.fyers.in/api/v3/orders", {
+          headers: { Authorization: `${appId}:${token}` },
+        });
+        const fyersData = (await fyersRes.json()) as any;
+        return fyersData.orderBook || [];
+      }
+      return db.prepare("SELECT * FROM paper_orders ORDER BY created_at DESC LIMIT 25").all() as any[];
+    },
+
+    placeOrder: async (params: TelegramOrderParams) => {
+      return executeOrderInternal(params);
+    },
+
+    cancelOrder: async (orderId: string, isPaper: boolean) => {
+      return cancelOrderInternal(orderId, isPaper);
+    },
+
+    squareOffPosition: async (symbol: string, isPaper: boolean) => {
+      return squareOffPositionInternal(symbol, isPaper);
+    },
+
+    squareOffAll: async (isPaper: boolean) => {
+      return squareOffAllPositionsInternal(isPaper);
+    },
+
+    getHoldings: async () => {
+      const { appId, token } = getTradingFyersAuth();
+      if (!appId || !token) throw new Error("FYERS credentials missing for holdings");
+      const res = await fetch("https://api-t1.fyers.in/api/v3/holdings", {
+        headers: { Authorization: `${appId}:${token}` },
+      });
+      return await res.json();
+    },
+
+    getSmartMoney: async (limit = 10) => {
+      try {
+        return db.prepare("SELECT * FROM smart_money_trail ORDER BY id DESC LIMIT @limit").all({ limit }) as any[];
+      } catch {
+        return [];
+      }
+    },
+
+    getTopMovers: async () => {
+      const quotes = Array.from(globalLiveQuoteCache.values());
+      const sorted = [...quotes].sort((a, b) => (b.pChange || 0) - (a.pChange || 0));
+      return {
+        gainers: sorted.slice(0, 5),
+        losers: sorted.slice(-5).reverse(),
+      };
+    },
+
+    getDaemonStatus: () => ({
+      active: daemonActive,
+      pid: daemonPythonProcess?.pid || null,
+      subscribedCount: subscribedSymbolSet.size,
+    }),
+
+    setDaemonActive: async (active: boolean) => {
+      if (active) {
+        daemonUserDisabled = false;
+        startMarketDataDaemon();
+        return { success: true, message: "Started market data streaming daemon." };
+      } else {
+        daemonUserDisabled = true;
+        killMarketDataDaemon();
+        return { success: true, message: "Stopped market data streaming daemon." };
+      }
+    },
+
+    getSystemStatus: async () => {
+      let totalTicks = 0;
+      try {
+        const row = db.prepare("SELECT COUNT(*) as c FROM ticks").get() as any;
+        totalTicks = row?.c || 0;
+      } catch {}
+      return {
+        uptime: Math.floor(process.uptime()),
+        memoryMB: Math.round(process.memoryUsage().rss / (1024 * 1024)),
+        cachedSymbolsCount: globalLiveQuoteCache.size,
+        totalTicks,
+        activeMode: "paper",
+      };
+    },
+  });
+
+  // REST APIs for Telegram Bot Settings and Live Testing
+  app.get("/api/telegram/status", (_req, res) => {
+    res.json(telegramService.getConfig());
+  });
+
+  app.post("/api/telegram/config", async (req, res) => {
+    try {
+      const { botToken, allowedChatIds, alertsEnabled, smartMoneyAlerts, orderAlerts, defaultTradingMode } = req.body;
+      const updates: Record<string, string> = {};
+      if (botToken !== undefined) updates.TELEGRAM_BOT_TOKEN = botToken;
+      if (allowedChatIds !== undefined) {
+        updates.TELEGRAM_CHAT_ID = Array.isArray(allowedChatIds) ? allowedChatIds.join(",") : String(allowedChatIds);
+      }
+      if (alertsEnabled !== undefined) updates.TELEGRAM_ALERTS_ENABLED = String(alertsEnabled);
+      if (smartMoneyAlerts !== undefined) updates.TELEGRAM_SMART_MONEY_ALERTS = String(smartMoneyAlerts);
+      if (orderAlerts !== undefined) updates.TELEGRAM_ORDER_ALERTS = String(orderAlerts);
+      if (defaultTradingMode !== undefined) updates.TELEGRAM_DEFAULT_MODE = defaultTradingMode;
+
+      updateEnvFile(updates);
+      const initResult = await telegramService.initBot();
+      res.json({ success: true, ...initResult, config: telegramService.getConfig() });
+    } catch (err: any) {
+      res.status(500).json({ error: "Failed to update Telegram configuration", detail: err?.message || err });
+    }
+  });
+
+  app.post("/api/telegram/test", async (_req, res) => {
+    try {
+      const testMsg =
+        `🔔 <b>FYERS Station: Test Notification</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `Your Telegram integration is online and communicating properly.\n` +
+        `Server Time: ${new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })}\n` +
+        `Type <code>/start</code> to access the interactive trading terminal.`;
+
+      const sent = await telegramService.sendAlert(testMsg);
+      if (sent) {
+        res.json({ success: true, message: "Test alert dispatched to Telegram." });
+      } else {
+        res.status(400).json({
+          success: false,
+          error: "Could not send alert. Ensure TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set and the bot is active.",
+        });
+      }
+    } catch (err: any) {
+      res.status(500).json({ error: "Test failed", detail: err?.message || err });
+    }
+  });
+
+  // Attempt non-blocking initialization of Telegram bot
+  telegramService.initBot().catch((err) => {
+    console.warn("[TELEGRAM] Background init catch:", err?.message || err);
+  });
+
   // Serve static frontend
   const distPath = path.join(process.cwd(), "dist");
   app.use(express.static(distPath));
@@ -4608,10 +5470,21 @@ async function startServer() {
 
   const server = app.listen(Number(PORT), "0.0.0.0", () => {
     console.log(`FYERS Server running on http://0.0.0.0:${PORT}`);
+    if (!useMock) {
+      startMarketDataDaemon();
+    }
   });
 
   const shutdown = () => {
     console.log("[SERVER] Received shutdown signal. Closing server...");
+    try {
+      telegramService.stopBot();
+    } catch {}
+    if (daemonPythonProcess) {
+      try {
+        daemonPythonProcess.kill();
+      } catch {}
+    }
     try {
       flushActiveBars();
     } catch {}
