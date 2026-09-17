@@ -1,0 +1,26 @@
+services:
+  fyers-station:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fyers_trading_station
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - WORKER_PORT=3001
+      - AUTO_ARCHIVE_TIME=15:40
+    ports:
+      - "3000:3000"
+    volumes:
+      # Persist Parquet files, Excel archives, and manifest
+      - ./backups:/app/backups
+      # Hot SQLite DB persistence
+      - ./data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"

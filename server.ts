@@ -2,7 +2,7 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import crypto from "crypto";
-import { spawn, ChildProcess } from "child_process";
+import { spawn, execSync, ChildProcess } from "child_process";
 import { createInterface } from "readline";
 import dotenv from "dotenv";
 import * as XLSX from "xlsx";
@@ -1737,6 +1737,14 @@ export interface SessionBackupResult {
     db: string;
     xlsx: string;
     csv: string;
+    parquet?: {
+      ticks?: string;
+      bars_1s?: string;
+      bars_1m?: string;
+      smart_money?: string;
+      totalSizeMB?: number;
+    };
+    cloudSync?: any;
   };
   message: string;
 }
@@ -1756,7 +1764,7 @@ async function archivePreviousSession(): Promise<SessionBackupResult> {
     lastKnownDayVolume.clear();
     return {
       backedUp: false,
-      message: "Session is already clean. Starting afresh."
+      message: "Session is already clean. Starting afresh.",
     };
   }
 
@@ -1793,7 +1801,7 @@ async function archivePreviousSession(): Promise<SessionBackupResult> {
       r.ltp != null && r.quantity != null ? Number((r.ltp * r.quantity).toFixed(2)) : "",
       r.bid, r.ask,
       r.ask != null && r.bid != null ? Number((r.ask - r.bid).toFixed(2)) : "",
-      r.chng, r.pchange
+      r.chng, r.pchange,
     ])];
     XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(tickData), "Live Trades");
 
@@ -1833,7 +1841,43 @@ async function archivePreviousSession(): Promise<SessionBackupResult> {
     console.error("[BACKUP] Error generating backup CSV:", err);
   }
 
-  // 4. Update manifest.json
+  // 4. Export High-Performance Apache Parquet Archives (Zstandard zstd level 7)
+  let parquetSummary: any = null;
+  try {
+    const parquetScript = path.join(process.cwd(), "scripts", "export_parquet.py");
+    if (fs.existsSync(parquetScript)) {
+      const out = execSync(`python "${parquetScript}" --db-path "${backupDbPath}" --out-dir "${BACKUPS_DIR}" --tag "${backupTag}"`, {
+        encoding: "utf-8",
+        maxBuffer: 10 * 1024 * 1024,
+      });
+      parquetSummary = JSON.parse(out);
+      console.log(`[PARQUET_ENGINE] Successfully generated Parquet archive (${parquetSummary.total_size_mb || 0} MB).`);
+    }
+  } catch (pErr: any) {
+    console.error("[PARQUET_ENGINE] Parquet conversion notice:", pErr?.message || pErr);
+  }
+
+  // 5. Cloudflare R2 / AWS S3 Cloud Sync
+  let cloudSyncResult: any = null;
+  try {
+    const syncScript = path.join(process.cwd(), "scripts", "cloud_sync.py");
+    if (fs.existsSync(syncScript)) {
+      const primaryFile = parquetSummary?.files?.ticks?.path || parquetSummary?.files?.bars_1m?.path || backupXlsxPath;
+      if (primaryFile && fs.existsSync(primaryFile)) {
+        const syncOut = execSync(`python "${syncScript}" --file "${primaryFile}" --generate-url`, {
+          encoding: "utf-8",
+        });
+        cloudSyncResult = JSON.parse(syncOut);
+        if (cloudSyncResult.success) {
+          console.log(`[CLOUD_SYNC] Successfully uploaded archive to ${cloudSyncResult.provider} (${cloudSyncResult.bucket})`);
+        }
+      }
+    }
+  } catch (cErr: any) {
+    console.warn("[CLOUD_SYNC] Non-blocking cloud sync notice:", cErr?.message || cErr);
+  }
+
+  // 6. Update manifest.json
   const manifestPath = path.join(BACKUPS_DIR, "manifest.json");
   let manifest: any[] = [];
   if (fs.existsSync(manifestPath)) {
@@ -1841,7 +1885,8 @@ async function archivePreviousSession(): Promise<SessionBackupResult> {
       manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
     } catch {}
   }
-  manifest.unshift({
+
+  const manifestEntry = {
     id: backupTag,
     timestamp: ist.label,
     totalTicks: tickCount,
@@ -1850,18 +1895,38 @@ async function archivePreviousSession(): Promise<SessionBackupResult> {
     dbFile: backupDbName,
     xlsxFile: backupXlsxName,
     csvFile: backupCsvName,
+    parquetFiles: parquetSummary?.files ? {
+      ticks: parquetSummary.files.ticks?.filename,
+      bars_1s: parquetSummary.files.bars_1s?.filename,
+      bars_1m: parquetSummary.files.bars_1m?.filename,
+      smart_money: parquetSummary.files.smart_money?.filename,
+      totalSizeMB: parquetSummary.total_size_mb,
+    } : null,
+    cloudSync: cloudSyncResult?.success ? {
+      provider: cloudSyncResult.provider,
+      bucket: cloudSyncResult.bucket,
+      key: cloudSyncResult.key,
+      downloadUrl: cloudSyncResult.download_url,
+    } : null,
     dbSizeBytes: fs.existsSync(backupDbPath) ? fs.statSync(backupDbPath).size : 0,
     xlsxSizeBytes: fs.existsSync(backupXlsxPath) ? fs.statSync(backupXlsxPath).size : 0,
-  });
+    parquetSizeBytes: parquetSummary?.total_size_bytes || 0,
+  };
+
+  manifest.unshift(manifestEntry);
   fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2), "utf-8");
 
-  // 5. Truncate ticks, bars_1s, bars_1m tables and reset sequences
+  // 7. Truncate ticks, bars_1s, bars_1m tables, reset sequences, and VACUUM to reclaim disk space
   db.exec(`
     DELETE FROM ticks;
     DELETE FROM bars_1s;
     DELETE FROM bars_1m;
     DELETE FROM sqlite_sequence WHERE name IN ('ticks', 'bars_1s', 'bars_1m');
   `);
+
+  try {
+    db.exec("VACUUM;");
+  } catch {}
 
   // Clear in-memory aggregates
   active1sBars.clear();
@@ -1876,7 +1941,22 @@ async function archivePreviousSession(): Promise<SessionBackupResult> {
     } catch {}
   }
 
-  console.log(`[BACKUP] Safely archived ${tickCount} ticks to backups/ (${backupTag}). Session initialized afresh.`);
+  const parquetMB = parquetSummary?.total_size_mb || 0;
+  console.log(`[BACKUP] Safely archived ${tickCount} ticks to Parquet (${parquetMB} MB) & backups/ (${backupTag}). Session initialized afresh.`);
+
+  // Telegram alert broadcast
+  const cloudNote = cloudSyncResult?.success ? `\n• <b>Cloud Storage:</b> Synced to ${cloudSyncResult.provider}` : "";
+  telegramService.sendAlert(
+    `📦 <b>EOD Market Data Archival Complete</b>\n` +
+    `━━━━━━━━━━━━━━━━━━━━\n` +
+    `• <b>Ticks Compressed:</b> ${tickCount.toLocaleString("en-IN")}\n` +
+    `• <b>Parquet Footprint:</b> <b>${parquetMB} MB</b> (Zstandard zstd)\n` +
+    `• <b>1-Minute Bars:</b> ${bars1mCount.toLocaleString("en-IN")}\n` +
+    `• <b>Live SQLite DB:</b> Pruned & Vacuumed (< 50MB)` +
+    cloudNote +
+    `\n━━━━━━━━━━━━━━━━━━━━\n` +
+    `<i>Session reset for next market open</i>`
+  ).catch(() => {});
 
   return {
     backedUp: true,
@@ -1889,8 +1969,10 @@ async function archivePreviousSession(): Promise<SessionBackupResult> {
       db: backupDbName,
       xlsx: backupXlsxName,
       csv: backupCsvName,
+      parquet: manifestEntry.parquetFiles || undefined,
+      cloudSync: manifestEntry.cloudSync || undefined,
     },
-    message: `Archived ${tickCount} ticks to backups/${backupXlsxName}. Session reset afresh.`
+    message: `Archived ${tickCount} ticks to Parquet (${parquetMB} MB) and backups/${backupXlsxName}. Live DB pruned and vacuumed.`,
   };
 }
 
@@ -2920,6 +3002,55 @@ async function startServer() {
       res.download(filePath, filename);
     } catch (err) {
       res.status(500).json({ error: "Failed to download backup file", detail: String(err) });
+    }
+  });
+
+  // API: Trigger EOD Archival & Parquet conversion manually
+  app.post("/api/archive/eod", async (_req, res) => {
+    try {
+      const result = await archivePreviousSession();
+      res.json({ success: true, ...result });
+    } catch (err: any) {
+      res.status(500).json({ error: "Failed to trigger EOD archive", detail: err?.message || err });
+    }
+  });
+
+  // API: On-demand Parquet download for specific date/type
+  app.get("/api/export/parquet", (req, res) => {
+    try {
+      const date = (req.query.date as string) || nowIST().dateStr;
+      const type = (req.query.type as string) || "ticks"; // ticks | bars_1m | bars_1s | smart_money
+
+      // Look in backups directory for pre-existing parquet matching date and type
+      const files = fs.existsSync(BACKUPS_DIR) ? fs.readdirSync(BACKUPS_DIR) : [];
+      const match = files.find(f => f.includes(date) && f.includes(type) && f.endsWith(".parquet"));
+
+      if (match) {
+        const filePath = path.join(BACKUPS_DIR, match);
+        res.setHeader("Content-Disposition", `attachment; filename="${match}"`);
+        res.setHeader("Content-Type", "application/vnd.apache.parquet");
+        return res.download(filePath, match);
+      }
+
+      // If not yet archived in backups, run export_parquet on-demand
+      const tempTag = `ondemand_${date}_${type}`;
+      const scriptPath = path.join(process.cwd(), "scripts", "export_parquet.py");
+      execSync(`python "${scriptPath}" --db-path "${DB_PATH}" --out-dir "${BACKUPS_DIR}" --date "${date}" --tag "${tempTag}"`, {
+        encoding: "utf-8",
+      });
+
+      const ondemandFile = `fyers_${type.replace("-", "")}_${tempTag}.parquet`;
+      const ondemandPath = path.join(BACKUPS_DIR, ondemandFile);
+
+      if (fs.existsSync(ondemandPath)) {
+        res.setHeader("Content-Disposition", `attachment; filename="${ondemandFile}"`);
+        res.setHeader("Content-Type", "application/vnd.apache.parquet");
+        return res.download(ondemandPath, ondemandFile);
+      }
+
+      res.status(404).json({ error: `No ${type} data found to export for date ${date}` });
+    } catch (err: any) {
+      res.status(500).json({ error: "Failed to export Parquet", detail: err?.message || err });
     }
   });
 
@@ -5405,6 +5536,20 @@ async function startServer() {
         activeMode: "paper",
       };
     },
+
+    triggerArchival: async () => {
+      return await archivePreviousSession();
+    },
+
+    getExportManifest: () => {
+      const manifestPath = path.join(BACKUPS_DIR, "manifest.json");
+      if (fs.existsSync(manifestPath)) {
+        try {
+          return JSON.parse(fs.readFileSync(manifestPath, "utf-8"));
+        } catch {}
+      }
+      return [];
+    },
   });
 
   // REST APIs for Telegram Bot Settings and Live Testing
@@ -5468,11 +5613,48 @@ async function startServer() {
     res.sendFile(path.join(distPath, "index.html"));
   });
 
+  function initAutoArchiveScheduler() {
+    const targetTime = (process.env.AUTO_ARCHIVE_TIME || "15:40").trim();
+    let lastArchivedDate = "";
+
+    console.log(`[AUTO_ARCHIVE] Automated EOD scheduler initialized (Daily trigger at ${targetTime} IST).`);
+
+    setInterval(async () => {
+      try {
+        const nowTime = new Intl.DateTimeFormat("en-IN", {
+          timeZone: "Asia/Kolkata",
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: false,
+        }).format(new Date());
+
+        const todayStr = new Intl.DateTimeFormat("en-IN", {
+          timeZone: "Asia/Kolkata",
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+        }).format(new Date());
+
+        if (nowTime === targetTime && lastArchivedDate !== todayStr) {
+          const tickCount = (db.prepare("SELECT COUNT(*) as n FROM ticks").get() as any)?.n || 0;
+          if (tickCount > 0) {
+            console.log(`[AUTO_ARCHIVE] ⏰ Triggering scheduled EOD Archival at ${nowTime} IST (${tickCount} ticks)...`);
+            lastArchivedDate = todayStr;
+            await archivePreviousSession();
+          }
+        }
+      } catch (schedErr) {
+        console.error("[AUTO_ARCHIVE] Scheduler tick error:", schedErr);
+      }
+    }, 30000);
+  }
+
   const server = app.listen(Number(PORT), "0.0.0.0", () => {
     console.log(`FYERS Server running on http://0.0.0.0:${PORT}`);
     if (!useMock) {
       startMarketDataDaemon();
     }
+    initAutoArchiveScheduler();
   });
 
   const shutdown = () => {

@@ -13,3 +13,5 @@ __pycache__/
 *.db-shm
 *.db-wal
 backups/
+data/
+*.parquet

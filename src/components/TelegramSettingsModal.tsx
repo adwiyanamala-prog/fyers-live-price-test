@@ -368,6 +368,8 @@ export const TelegramSettingsModal: React.FC<TelegramSettingsModalProps> = ({ is
                 { cmd: '/squareoff_all', desc: 'Emergency panic square off all' },
                 { cmd: '/smartmoney', desc: 'Institutional block orders trail' },
                 { cmd: '/top', desc: 'Top gainers & losers screener' },
+                { cmd: '/export', desc: 'EOD Parquet archive & cloud sync' },
+                { cmd: '/mode live', desc: 'Toggle paper/live trading mode' },
                 { cmd: '/daemon status', desc: 'Control market streaming process' },
               ].map((item) => (
                 <div

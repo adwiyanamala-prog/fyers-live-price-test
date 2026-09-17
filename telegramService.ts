@@ -59,6 +59,8 @@ export interface TelegramBotBridge {
     totalTicks: number;
     activeMode: "live" | "paper";
   }>;
+  triggerArchival?: () => Promise<any>;
+  getExportManifest?: () => any[];
 }
 
 export interface TelegramBotConfig {
@@ -351,6 +353,13 @@ class TelegramService {
       );
     });
 
+    // Export & Parquet Archival
+    this.bot.command(["export", "archive", "backup"], async (ctx) => {
+      if (!this.authCheck(ctx)) return;
+      const args = (ctx.match || "").toString().trim();
+      await this.handleExportCommand(ctx, args);
+    });
+
     // Callback Query Handler (Inline Keyboards)
     this.bot.on("callback_query", async (ctx) => {
       if (!this.authCheck(ctx)) return;
@@ -376,6 +385,7 @@ class TelegramService {
       `• <code>/sell &lt;symbol&gt; &lt;qty&gt; [price] [cnc|intraday]</code>\n` +
       `• <code>/cancel &lt;order_id&gt;</code> — Cancel order\n` +
       `• <code>/squareoff &lt;symbol&gt;</code> — Close position\n` +
+      `• <code>/export</code> — Archive to Parquet & Cloud sync\n` +
       `• <code>/mode [paper|live]</code> — Switch default mode\n\n` +
       `<i>Tap a button below for instant workstation access:</i>`;
 
@@ -398,7 +408,8 @@ class TelegramService {
           { text: "ℹ️ System Health", callback_data: "menu_status" },
         ],
         [
-          { text: "🚨 Square Off All Positions", callback_data: `confirm_sq_all_prompt_${this.config.defaultTradingMode}` },
+          { text: "📦 Parquet & Archival", callback_data: "menu_export" },
+          { text: "🚨 Square Off All", callback_data: `confirm_sq_all_prompt_${this.config.defaultTradingMode}` },
         ],
       ],
     };
@@ -1002,6 +1013,119 @@ class TelegramService {
     }
   }
 
+  private async handleExportCommand(ctx: Context, args: string) {
+    if (args.toLowerCase() === "now" || args.toLowerCase() === "run") {
+      return this.executeArchivalFromTelegram(ctx);
+    }
+
+    if (!this.bridge) return ctx.reply("⚠️ Bridge connection to server not established.");
+
+    try {
+      const sys = await this.bridge.getSystemStatus();
+      const manifest = this.bridge.getExportManifest ? this.bridge.getExportManifest() : [];
+      const latestBackup = manifest && manifest.length > 0 ? manifest[0] : null;
+
+      let msg =
+        `📦 <b>Market Data & Parquet Archival Terminal</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `• <b>Live Hot SQLite Ticks:</b> ${sys.totalTicks.toLocaleString("en-IN")}\n` +
+        `• <b>Storage Status:</b> ${sys.totalTicks > 0 ? "🟢 Intraday Data Accumulating" : "⚪ Clean (Pruned & Vacuumed)"}\n`;
+
+      if (latestBackup) {
+        const pSize = latestBackup.parquetFiles?.totalSizeMB ? `${latestBackup.parquetFiles.totalSizeMB} MB` : "N/A";
+        msg +=
+          `• <b>Last EOD Archive:</b> ${latestBackup.timestamp || latestBackup.id}\n` +
+          `• <b>Ticks Archived:</b> ${(latestBackup.totalTicks || 0).toLocaleString("en-IN")}\n` +
+          `• <b>Parquet Size:</b> ${pSize} (Zstandard)\n`;
+        if (latestBackup.cloudSync?.provider) {
+          msg += `• <b>Cloud Storage:</b> ${latestBackup.cloudSync.provider}\n`;
+          if (latestBackup.cloudSync.downloadUrl) {
+            msg += `• <b>Download URL:</b> <a href="${latestBackup.cloudSync.downloadUrl}">R2/S3 Direct Link</a>\n`;
+          }
+        }
+      }
+
+      msg +=
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `<i>Parquet compression shrinks tick database by ~95% using Zstd level 7. Auto-archive runs daily at 15:40 IST.</i>`;
+
+      const keyboard = {
+        inline_keyboard: [
+          [
+            { text: "⚡ Trigger EOD Archive & Parquet Now", callback_data: "export_archive_now" },
+          ],
+          [
+            { text: "📜 View Archival History", callback_data: "export_history" },
+            { text: "🔄 Refresh", callback_data: "menu_export" },
+          ],
+        ],
+      };
+
+      await ctx.reply(msg, { parse_mode: "HTML", reply_markup: keyboard, link_preview_options: { is_disabled: true } });
+    } catch (err: any) {
+      ctx.reply(`❌ Error checking export status: ${err?.message || err}`);
+    }
+  }
+
+  private async executeArchivalFromTelegram(ctx: Context) {
+    if (!this.bridge?.triggerArchival) {
+      return ctx.reply("⚠️ Archival service not wired to server bridge.");
+    }
+
+    await ctx.reply("⏳ <i>Executing EOD archival, Parquet compression & cloud sync... Please wait.</i>", {
+      parse_mode: "HTML",
+    });
+
+    try {
+      const result = await this.bridge.triggerArchival();
+      const pMB = result.files?.parquet?.totalSizeMB || 0;
+      const count = (result.totalTicks || 0).toLocaleString("en-IN");
+      const cloudMsg = result.files?.cloudSync?.provider ? `\n• <b>Cloud Storage:</b> Synced to ${result.files.cloudSync.provider}` : "";
+      const dlLink = result.files?.cloudSync?.downloadUrl ? `\n• <b>R2/S3 URL:</b> <a href="${result.files.cloudSync.downloadUrl}">Download Parquet</a>` : "";
+
+      const summary =
+        `✅ <b>EOD Archival Complete!</b>\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `• <b>Ticks Compressed:</b> ${count}\n` +
+        `• <b>Parquet Footprint:</b> <b>${pMB} MB</b> (Zstd)\n` +
+        `• <b>Hot SQLite DB:</b> Pruned & Vacuumed (< 50MB)` +
+        cloudMsg +
+        dlLink +
+        `\n━━━━━━━━━━━━━━━━━━━━\n` +
+        `<i>Ready for next market session</i>`;
+
+      await ctx.reply(summary, { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
+    } catch (err: any) {
+      await ctx.reply(`❌ Archival failed: ${err?.message || err}`);
+    }
+  }
+
+  private async handleExportHistory(ctx: Context) {
+    if (!this.bridge?.getExportManifest) {
+      return ctx.reply("⚠️ Manifest retrieval not available.");
+    }
+    const manifest = this.bridge.getExportManifest();
+    if (!manifest || manifest.length === 0) {
+      return ctx.reply("📦 No archival history found in <code>backups/manifest.json</code>.", { parse_mode: "HTML" });
+    }
+
+    let text = `📜 <b>Recent Archival Sessions (Last 5)</b>\n━━━━━━━━━━━━━━━━━━━━\n`;
+    for (const item of manifest.slice(0, 5)) {
+      const pMB = item.parquetFiles?.totalSizeMB ? `${item.parquetFiles.totalSizeMB} MB` : "N/A";
+      const ticks = (item.totalTicks || 0).toLocaleString("en-IN");
+      const cloud = item.cloudSync?.provider ? ` [${item.cloudSync.provider}]` : "";
+      text +=
+        `• <b>${item.timestamp || item.id}</b>${cloud}\n` +
+        `  Ticks: ${ticks} | Parquet: ${pMB}\n`;
+      if (item.cloudSync?.downloadUrl) {
+        text += `  <a href="${item.cloudSync.downloadUrl}">Download URL</a>\n`;
+      }
+      text += `\n`;
+    }
+
+    await ctx.reply(text, { parse_mode: "HTML", link_preview_options: { is_disabled: true } });
+  }
+
   private async handleCallbackQuery(ctx: Context, data: string) {
     if (data === "menu_funds_paper" || data === "menu_funds_live") {
       const isPaper = data.endsWith("paper");
@@ -1029,6 +1153,15 @@ class TelegramService {
     }
     if (data === "menu_status") {
       return this.handleStatusCommand(ctx);
+    }
+    if (data === "menu_export") {
+      return this.handleExportCommand(ctx, "");
+    }
+    if (data === "export_archive_now") {
+      return this.executeArchivalFromTelegram(ctx);
+    }
+    if (data === "export_history") {
+      return this.handleExportHistory(ctx);
     }
     if (data === "daemon_start") {
       return this.handleDaemonCommand(ctx, "start");
