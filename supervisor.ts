@@ -2,7 +2,7 @@ import express from "express";
 import http from "http";
 import path from "path";
 import fs from "fs";
-import { spawn, ChildProcess } from "child_process";
+import { spawn, execSync, ChildProcess } from "child_process";
 
 const SUPERVISOR_PORT = Number(process.env.PORT) || 3000;
 const WORKER_PORT = Number(process.env.WORKER_PORT) || 3001;
@@ -54,6 +54,15 @@ function appendLog(rawText: string, defaultLevel: "info" | "warn" | "error" | "s
       level,
       text: line,
     };
+
+    // Print directly to terminal console
+    if (level === "error") {
+      console.error(`[${entry.timestamp}] ${line}`);
+    } else if (level === "warn") {
+      console.warn(`[${entry.timestamp}] ${line}`);
+    } else {
+      console.log(`[${entry.timestamp}] ${line}`);
+    }
 
     logBuffer.push(entry);
     if (logBuffer.length > MAX_LOGS) {
@@ -153,19 +162,24 @@ function startWorker(): { success: boolean; pid?: number; message: string } {
 }
 
 function killWorker(): { success: boolean; message: string } {
-  if (!workerProcess) {
-    return { success: false, message: "Backend server is not running." };
-  }
-
-  const pid = workerProcess.pid;
-  appendLog(`[SUPERVISOR] Terminating backend worker (PID: ${pid})...`, "system");
+  const pid = workerProcess?.pid;
+  appendLog(`[SUPERVISOR] Terminating backend worker (PID: ${pid || "unknown"})...`, "system");
 
   try {
-    if (process.platform === "win32" && pid) {
-      // Cleanly kill process tree on Windows
-      spawn("taskkill", ["/PID", String(pid), "/T", "/F"]);
-    } else {
-      workerProcess.kill("SIGTERM");
+    if (process.platform === "win32") {
+      if (pid) {
+        try { execSync(`taskkill /PID ${pid} /T /F`, { stdio: "ignore" }); } catch {}
+      }
+      // Guarantee port is completely freed by killing any process bound to it
+      try {
+        const out = execSync(`powershell -Command "(Get-NetTCPConnection -LocalPort ${WORKER_PORT} -ErrorAction SilentlyContinue).OwningProcess"`, { encoding: "utf-8" }).trim();
+        const portPid = parseInt(out, 10);
+        if (portPid && portPid !== process.pid) {
+          execSync(`taskkill /PID ${portPid} /T /F`, { stdio: "ignore" });
+        }
+      } catch {}
+    } else if (workerProcess) {
+      workerProcess.kill("SIGKILL");
     }
   } catch (err: any) {
     appendLog(`[SUPERVISOR] Error killing process: ${err.message}`, "error");
@@ -175,7 +189,7 @@ function killWorker(): { success: boolean; message: string } {
   workerStartTime = null;
   broadcastStatus();
 
-  return { success: true, message: `Terminated backend process (PID: ${pid}).` };
+  return { success: true, message: `Terminated backend process.` };
 }
 
 // ============================================================================
@@ -183,10 +197,18 @@ function killWorker(): { success: boolean; message: string } {
 // ============================================================================
 const app = express();
 
+const allowedOrigin = process.env.ALLOWED_ORIGIN || "*";
+
 app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE, PUT");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "SAMEORIGIN");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
   next();
 });
 
@@ -326,6 +348,27 @@ app.all("/api/*", (req, res) => {
 
 async function initSupervisor() {
   const isDev = process.env.NODE_ENV !== "production";
+
+  const killPort = (port: number) => {
+    try {
+      if (process.platform === "win32") {
+        const out = execSync(`powershell -Command "(Get-NetTCPConnection -LocalPort ${port} -ErrorAction SilentlyContinue).OwningProcess"`, { encoding: "utf-8" }).trim();
+        const pid = parseInt(out, 10);
+        if (pid && pid !== process.pid) {
+          appendLog(`[SUPERVISOR] Found zombie process (PID: ${pid}) on port ${port}. Force killing...`, "system");
+          execSync(`taskkill /PID ${pid} /T /F`, { stdio: "ignore" });
+        }
+      } else {
+        execSync(`lsof -t -i:${port} | xargs -r kill -9`, { stdio: "ignore" });
+      }
+    } catch (e) {
+      // Ignore errors if no process is found
+    }
+  };
+
+  // Aggressive Kill-and-Claim for both ports
+  killPort(SUPERVISOR_PORT);
+  killPort(WORKER_PORT);
 
   if (isDev) {
     try {

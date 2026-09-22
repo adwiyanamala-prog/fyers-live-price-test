@@ -2,17 +2,38 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AdwiKetan Live Prices Monitor</title>
-    <meta name="description" content="An application built with Google AI Studio." />
-    <meta property="og:title" content="AdwiKetan Live Prices Monitor" />
-    <meta property="og:description" content="An application built with Google AI Studio." />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <title>AdwiKetan Trading Desk | Live Market & Execution Terminal</title>
+    <meta name="description" content="Institutional-grade real-time market terminal, stock screener, and execution desk powered by FYERS API v3" />
+    
+    <!-- PWA & Mobile Web App Manifest -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="apple-touch-icon" href="/icons/icon-192.svg" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="TradingDesk" />
+    <meta name="theme-color" content="#0f172a" />
+    <meta name="mobile-web-app-capable" content="yes" />
+
+    <!-- OpenGraph & Social Cards -->
+    <meta property="og:title" content="AdwiKetan Trading Desk | Live Market & Execution Terminal" />
+    <meta property="og:description" content="Sub-millisecond real-time market terminal, stock screener, and institutional order ticket for Indian Equities" />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
   </head>
-  <body>
+  <body class="bg-slate-950 text-slate-100 antialiased overflow-x-hidden selection:bg-sky-500/30 selection:text-sky-200">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
+    <script>
+      if ('serviceWorker' in navigator && window.location.protocol.startsWith('http')) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('/sw.js').catch((err) => {
+            console.warn('PWA service worker registration skipped:', err);
+          });
+        });
+      }
+    </script>
   </body>
 </html>
 

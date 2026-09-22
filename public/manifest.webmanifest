@@ -1,0 +1,49 @@
+{
+  "name": "AdwiKetan Trading Desk - Live Market Terminal",
+  "short_name": "TradingDesk",
+  "description": "Institutional-grade real-time market terminal, stock screener, and execution desk powered by FYERS API v3",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0f172a",
+  "theme_color": "#0284c7",
+  "categories": ["finance", "productivity", "business"],
+  "icons": [
+    {
+      "src": "/icons/icon-192.svg",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-512.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Live Monitor",
+      "short_name": "Monitor",
+      "description": "Open live market streaming terminal",
+      "url": "/?tab=monitor",
+      "icons": [{ "src": "/icons/icon-192.svg", "sizes": "192x192" }]
+    },
+    {
+      "name": "Stock Screener",
+      "short_name": "Screener",
+      "description": "Open multi-timeframe stock screener",
+      "url": "/?tab=screener",
+      "icons": [{ "src": "/icons/icon-192.svg", "sizes": "192x192" }]
+    },
+    {
+      "name": "Trading Terminal",
+      "short_name": "Trade",
+      "description": "Open order ticket and portfolio",
+      "url": "/?tab=trading",
+      "icons": [{ "src": "/icons/icon-192.svg", "sizes": "192x192" }]
+    }
+  ]
+}

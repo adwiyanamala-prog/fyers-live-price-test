@@ -13,6 +13,23 @@ import { telegramService, TelegramBotBridge, TelegramOrderParams } from "./teleg
 dotenv.config();
 dotenv.config({ path: path.join(process.cwd(), "fyers-price-test", ".env") });
 
+// ============================================================================
+// STARTUP HEALTH CHECKS
+// ============================================================================
+const requiredEnvVars = ["TELEGRAM_BOT_TOKEN"];
+const missingVars = requiredEnvVars.filter((key) => !process.env[key] || process.env[key].trim() === "");
+
+if (missingVars.length > 0) {
+  console.error("\n========================================================");
+  console.error("⛔ STARTUP ABORTED: MISSING CRITICAL ENVIRONMENT VARIABLES");
+  console.error("========================================================");
+  console.error(`The following variables are missing or empty in your .env file:`);
+  missingVars.forEach((v) => console.error(` - ${v}`));
+  console.error("\nPlease add them to the .env file in the project root.");
+  console.error("========================================================\n");
+  process.exit(1);
+}
+
 // SHA-256 helper for FYERS auth
 function sha256(text: string): string {
   return crypto.createHash("sha256").update(text).digest("hex");
@@ -155,6 +172,9 @@ function startMarketDataDaemon() {
     daemonActive = true;
     telegramService.notifyDaemonAlert("started", `Market data daemon started with ${subscribedSymbolSet.size} tickers`).catch(() => {});
 
+    let tickCounter = 0;
+    let lastTickHeartbeat = Date.now();
+
     const rl = createInterface({ input: daemonPythonProcess.stdout });
 
     rl.on("line", (line: string) => {
@@ -162,6 +182,13 @@ function startMarketDataDaemon() {
         const data = JSON.parse(line);
 
         if (data.type === "tick" && data.symbol && data.ltp) {
+          tickCounter++;
+          const now = Date.now();
+          if (now - lastTickHeartbeat >= 5000) {
+            console.log(`[LIVE_FEED] ⚡ Ingested ${tickCounter} ticks across ${subscribedSymbolSet.size} tickers | Latest: ${data.symbol} ₹${data.ltp}`);
+            lastTickHeartbeat = now;
+          }
+
           const ltp = Number(data.ltp);
           const change = Number(data.change ?? 0);
           const pChange = Number(data.pChange ?? 0);
@@ -208,8 +235,16 @@ function startMarketDataDaemon() {
           });
 
           // Forward to all active SSE subscribers
+          const tickDate = data.date || nowIST().dateStr;
+          const tickTime = data.time || nowIST().timeStr;
+          const formattedLine = `${tickDate} ${tickTime} | ${(data.symbol || "").padEnd(17)} | LTP: ${ltp.toFixed(2).padStart(8)} | Vol: ${(data.volume ?? 0).toString().padStart(8)} | Bid: ${bid.toFixed(2)} Ask: ${ask.toFixed(2)}`;
+
           broadcastSseEvent("tick", {
+            line: formattedLine,
             symbol: data.symbol,
+            date: tickDate,
+            time: tickTime,
+            timestamp: data.timestamp || `${tickDate} ${tickTime}`,
             ltp,
             change,
             pChange,
@@ -217,13 +252,20 @@ function startMarketDataDaemon() {
             low: data.low ?? ltp,
             open: data.open ?? ltp,
             close: data.close ?? ltp,
+            quantity: data.quantity ?? 1,
             volume: data.volume ?? 0,
             average: data.average ?? ltp,
+            tradeValue: Number((ltp * (data.quantity ?? 1)).toFixed(2)),
             bid,
             ask,
-            timestamp: data.timestamp || `${data.date} ${data.time}`,
+            spread,
           });
+        } else if (data.type === "status") {
+          console.log(`[FYERS_BRIDGE] 📡 ${data.message}`);
+        } else if (data.type === "error") {
+          console.warn(`[FYERS_BRIDGE] ⚠️ ${data.message}`);
         } else if (data.type === "auth_error") {
+          console.error(`[FYERS_BRIDGE] ❌ ${data.message}`);
           broadcastSseEvent("token_expired", { message: data.message, timestamp: nowIST().label });
         }
       } catch {}
@@ -1070,6 +1112,26 @@ const insertBar1m = db.prepare(`
   VALUES (@date, @time, @symbol, @open, @high, @low, @close, @volume, @trades, @chng, @pchange, @day_volume)
 `);
 
+const insertSmartMoneyStmt = db.prepare(`
+  INSERT INTO smart_money_trail (date, symbol, company_name, sector, ltp, volume_multiple, trade_size_mult, aggressor_ratio, price_spread_pct, pattern_type, score, note)
+  VALUES (@date, @symbol, @company_name, @sector, @ltp, @volume_multiple, @trade_size_mult, @aggressor_ratio, @price_spread_pct, @pattern_type, @score, @note)
+`);
+
+const selectPendingOrdersStmt = db.prepare(`
+  SELECT * FROM paper_orders 
+  WHERE symbol = @symbol AND status = 'PENDING'
+`);
+
+const selectOpenPosStmt = db.prepare(`
+  SELECT * FROM paper_positions WHERE symbol = @symbol AND qty > 0
+`);
+
+const selectActiveBracketsStmt = db.prepare(`
+  SELECT * FROM paper_orders 
+  WHERE symbol = @symbol AND status = 'COMPLETE' AND (stop_loss IS NOT NULL OR take_profit IS NOT NULL)
+  ORDER BY rowid DESC LIMIT 1
+`);
+
 // 1-Second Bar In-Memory Aggregator
 export interface BarOHLCV {
   date: string;
@@ -1401,12 +1463,7 @@ function inspectSmartMoneyFootprint(tick: {
     };
 
     try {
-      const insertStmt = db.prepare(`
-        INSERT INTO smart_money_trail (date, symbol, company_name, sector, ltp, volume_multiple, trade_size_mult, aggressor_ratio, price_spread_pct, pattern_type, score, note)
-        VALUES (@date, @symbol, @company_name, @sector, @ltp, @volume_multiple, @trade_size_mult, @aggressor_ratio, @price_spread_pct, @pattern_type, @score, @note)
-      `);
-
-      const result = insertStmt.run({
+      const result = insertSmartMoneyStmt.run({
         date: tick.date,
         symbol: sym,
         company_name: meta.name,
@@ -1542,10 +1599,7 @@ function reconcilePaperOrdersOnTick(symbol: string, ltp: number) {
 
   try {
     // 1. Check pending limit orders for this symbol
-    const pendingOrders = db.prepare(`
-      SELECT * FROM paper_orders 
-      WHERE symbol = @symbol AND status = 'PENDING'
-    `).all({ symbol }) as any[];
+    const pendingOrders = selectPendingOrdersStmt.all({ symbol }) as any[];
 
     for (const ord of pendingOrders) {
       if (ord.order_type === 'LIMIT') {
@@ -1564,13 +1618,9 @@ function reconcilePaperOrdersOnTick(symbol: string, ltp: number) {
     }
 
     // 2. Check active positions with filled bracket orders (Auto TP / SL Exits)
-    const openPos = db.prepare("SELECT * FROM paper_positions WHERE symbol = @symbol AND qty > 0").get({ symbol }) as any;
+    const openPos = selectOpenPosStmt.get({ symbol }) as any;
     if (openPos) {
-      const activeBrackets = db.prepare(`
-        SELECT * FROM paper_orders 
-        WHERE symbol = @symbol AND status = 'COMPLETE' AND (stop_loss IS NOT NULL OR take_profit IS NOT NULL)
-        ORDER BY rowid DESC LIMIT 1
-      `).all({ symbol }) as any[];
+      const activeBrackets = selectActiveBracketsStmt.all({ symbol }) as any[];
 
       if (activeBrackets.length > 0) {
         const brk = activeBrackets[0];
@@ -2578,10 +2628,17 @@ async function startServer() {
 
   console.log(`Mode: ${useMock ? "MOCK (simulated data)" : "LIVE (real FYERS WebSocket)"}`);
 
+  const allowedOrigin = process.env.ALLOWED_ORIGIN || "*";
   app.use((req, res, next) => {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE, PUT");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "SAMEORIGIN");
+    res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+    if (req.method === "OPTIONS") {
+      return res.sendStatus(204);
+    }
     next();
   });
 
@@ -5291,7 +5348,45 @@ async function startServer() {
     if (useMock) {
       cleanup = startMockStream(requestedSymbols, granularity, sendEvent, () => res.end());
     } else {
-      cleanup = startLiveStream(requestedSymbols, granularity, sendEvent, () => res.end());
+      // Live mode: Leverage persistent daemon to avoid FYERS duplicate WebSocket conflicts
+      subscribeMarketSymbols(requestedSymbols);
+
+      sendEvent("log", { type: "status", message: "Connected successfully to FYERS WebSocket.", timestamp: nowIST().label });
+      sendEvent("log", { type: "status", message: `Subscribed to ${requestedSymbols.length} symbols: ${requestedSymbols.slice(0, 5).join(", ")}...`, timestamp: nowIST().label });
+      sendEvent("log", { type: "status", message: "Streaming live ticks & recording market data in real-time...", timestamp: nowIST().label });
+
+      // Immediately send existing cached quotes so UI populates without delay
+      for (const sym of requestedSymbols) {
+        const cached = globalLiveQuoteCache.get(sym);
+        if (cached) {
+          const tDate = nowIST().dateStr;
+          const tTime = nowIST().timeStr;
+          const line = `${tDate} ${tTime} | ${(sym).padEnd(17)} | LTP: ${cached.ltp.toFixed(2).padStart(8)} | Vol: ${(cached.volume ?? 0).toString().padStart(8)} | Bid: ${(cached.bid ?? cached.ltp).toFixed(2)} Ask: ${(cached.ask ?? cached.ltp).toFixed(2)}`;
+          sendEvent("tick", {
+            line,
+            symbol: sym,
+            date: tDate,
+            time: tTime,
+            timestamp: `${tDate} ${tTime}`,
+            ltp: cached.ltp,
+            change: cached.change,
+            pChange: cached.pChange,
+            high: cached.high,
+            low: cached.low,
+            open: cached.open,
+            close: cached.prevClose,
+            quantity: 1,
+            volume: cached.volume,
+            average: cached.vwap,
+            tradeValue: cached.ltp,
+            bid: cached.bid ?? cached.ltp,
+            ask: cached.ask ?? cached.ltp,
+            spread: cached.spread ?? 0.1,
+          });
+        }
+      }
+
+      cleanup = () => {};
     }
 
     // Client disconnect - kill stream

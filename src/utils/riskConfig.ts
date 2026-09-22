@@ -329,3 +329,15 @@ export function validateOrderRisk(params: {
     checks,
   };
 }
+
+/**
+ * Calculates max safe position size based on risk budget, capital ceiling, and fat-finger cap
+ */
+export function calculateMaxQty(entryPrice: number, stopLossPrice: number, riskBudget: number): number {
+  const riskPerShare = Math.max(0.01, Math.abs(entryPrice - stopLossPrice));
+  const qtyByRisk = Math.floor(riskBudget / riskPerShare);
+  const config = getRiskConfig();
+  const qtyByCapital = Math.floor(config.maxOrderValue / Math.max(0.01, entryPrice));
+  return Math.max(1, Math.min(qtyByRisk, qtyByCapital, config.maxQuantityCap));
+}
+
