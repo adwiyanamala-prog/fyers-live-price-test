@@ -293,6 +293,22 @@ function startMarketDataDaemon() {
   }
 }
 
+function restartMarketDataDaemon() {
+  console.log("[MARKET_DAEMON] Restarting daemon with fresh configuration...");
+  if (daemonPythonProcess) {
+    daemonUserDisabled = true; // prevent auto-restart loop
+    try {
+      daemonPythonProcess.kill("SIGTERM");
+    } catch {}
+    daemonPythonProcess = null;
+    daemonActive = false;
+  }
+  setTimeout(() => {
+    daemonUserDisabled = false;
+    startMarketDataDaemon();
+  }, 1000);
+}
+
 // Helper to fetch live quotes: Priority 1: globalLiveQuoteCache -> Priority 2: SQLite ticks -> Priority 3: throttled REST
 async function fetchFyersQuotes(symbols: string[]): Promise<Map<string, any>> {
   const quoteMap = new Map<string, any>();
@@ -1839,8 +1855,9 @@ async function archivePreviousSession(): Promise<SessionBackupResult> {
     console.error("[BACKUP] SQLite backup error:", backupErr);
   }
 
-  // 2. Export multi-sheet XLSX archive
-  try {
+  // 2. Export multi-sheet XLSX archive (Only if small enough to fit in JS memory)
+  if (tickCount <= 50000) {
+    try {
     const wb = XLSX.utils.book_new();
 
     // Live trades sheet
@@ -1889,6 +1906,9 @@ async function archivePreviousSession(): Promise<SessionBackupResult> {
     fs.writeFileSync(backupCsvPath, csvHeader + csvBody, "utf-8");
   } catch (err) {
     console.error("[BACKUP] Error generating backup CSV:", err);
+  }
+  } else {
+    console.log(`[BACKUP] Tick count (${tickCount}) exceeds 50,000 threshold. Skipping XLSX and CSV export to prevent memory exhaustion. Only .db and .parquet backups created.`);
   }
 
   // 4. Export High-Performance Apache Parquet Archives (Zstandard zstd level 7)
@@ -2835,6 +2855,7 @@ async function startServer() {
           FYERS_SECRET_KEY: secretKey,
           MOCK_MODE: "false",
         });
+        restartMarketDataDaemon();
       }
 
       if (state) pendingAuthMap.delete(state);
@@ -2961,6 +2982,7 @@ async function startServer() {
           updates.FYERS_SECRET_KEY = secretKey;
         }
         updateEnvFile(updates);
+        restartMarketDataDaemon();
 
         // Also sync to fyers-price-test/.env if directory exists
         try {

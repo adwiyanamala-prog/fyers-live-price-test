@@ -626,6 +626,9 @@ export default function App() {
           setStatus('connected');
         } else if (data.message.includes('Waiting for market data')) {
           setStatus('streaming');
+        } else if (data.type === 'error' || data.message.toLowerCase().includes('failed') || data.message.toLowerCase().includes('unauthorized') || data.message.toLowerCase().includes('expired')) {
+          setStatus('stopped');
+          setIsRunning(false);
         }
 
         setLogs(prev => [
